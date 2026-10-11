@@ -2,18 +2,19 @@
 
 ## Host regression tests
 
-Use a host C compiler with AddressSanitizer and UndefinedBehaviorSanitizer. The filter and registration suites compile cJSON from the ESP-IDF checkout used by the firmware.
+`nix flake check` runs the host suites and the S3 firmware build in isolated Nix builds. `flake.lock` pins ESP-IDF, compilers, and other build dependencies. The checks use build-only credentials and do not access a tailnet.
+
+For a host-only run:
 
 ```sh
-export IDF_PATH=/path/to/esp-idf
-tests/run-host-tests
+nix develop --command tests/run-host-tests
 ```
 
 The suites exercise receive filtering, coordinator URL parsing, node-key storage, registration framing, network-switch ownership, and AT socket address validation. Platform stubs cover selected failure paths; they do not model RTOS scheduling or modem behavior.
 
 ## Firmware build
 
-Load the ESP-IDF 5.5.2 environment and build `examples/minimal` as described in the README. The example defaults target the tested S3 board. Build checks do not require real credentials or a connected device. `tests/build-minimal` uses `sdkconfig.ci` placeholders in a separate build directory so the compiler retains the complete networking path. That firmware is for build validation only and must not be flashed. Configure real credentials only in the ignored `sdkconfig` before a hardware run.
+Enter `nix develop` and build `examples/minimal` as described in the README. The example defaults target the tested S3 board. Build checks do not require real credentials or a connected device. `tests/build-minimal` uses `sdkconfig.ci` placeholders in a separate build directory so the compiler retains the complete networking path. That firmware is for build validation only and must not be flashed. Configure real credentials only in the ignored `sdkconfig` before a hardware run.
 
 The older examples remain available for reference. They have board-specific defaults and optional application services. They are not the validated entry point for this fork.
 
@@ -25,6 +26,6 @@ A 256 KiB download matched its expected SHA-256 over direct and relayed paths. A
 
 ESPHome builds of the patched source passed for S3 Quad PSRAM and C3. A cellular/PPP/network-switch build also passed. These are prior compile results for the extracted source, not runtime validation of those configurations or the new minimal example.
 
-Before a release, repeat affected tests against the exact release candidate. Evidence from the earlier harness does not automatically cover later code changes. [Known gaps](docs/limitations.md).
+Before a release, repeat affected tests against the exact release candidate. Evidence from the earlier harness does not automatically cover later code changes. [Open work](docs/open-work.md).
 
-The standalone extraction passes all six host sanitizer suites and links the minimal S3 example with the client, coordinator, DERP, and WireGuard manager present in the ELF. The build-only image is approximately 0.99 MB with ESP-IDF 5.5.2. Existing unused-variable/function warnings remain in inherited code. GitHub Actions runs the same host suites and example build; the hosted job has not run before publication.
+The standalone extraction passes all six host sanitizer suites and links the minimal S3 example with the client, coordinator, DERP, and WireGuard manager present in the ELF. The build-only image is approximately 0.99 MB with ESP-IDF 5.5.2. Existing unused-variable/function warnings remain in inherited code. GitHub Actions runs `nix flake check` with the committed lock file.

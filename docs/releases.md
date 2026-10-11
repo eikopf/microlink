@@ -4,11 +4,11 @@ This fork uses SemVer tags in the `v0.x.y` range. Its first planned release is `
 
 Patch releases contain fixes that preserve the documented integration contract. Minor releases may change APIs, configuration, resource requirements, or persisted state. Release notes must describe those changes and any migration or downgrade restrictions. These are fork-specific conventions within SemVer's initial-development range.
 
-Upstream's v1/v2 names describe earlier implementations. They do not establish a stability guarantee or set this fork's release numbering. Upstream history is retained; published tags are not rewritten.
+Upstream's v1/v2 names describe earlier implementations. They do not establish a stability guarantee or set this fork's release numbering. Upstream commits are retained. Inherited tags (`v1.*`, `v2.*`, and `stable-pre-rwsplit`) were removed from this fork so they do not appear as its releases. Tags published for this fork will not be rewritten.
 
 Before a release:
 
-1. Run `tests/run-host-tests` and `tests/build-minimal` from a clean checkout with the ESP-IDF environment loaded.
+1. Run `nix flake check` from a clean checkout.
 2. Repeat relevant hardware tests for transport, shutdown, and key handling changes. Record the board, SDK, configuration, and remaining gaps.
 3. Review the changes for credentials, unsupported claims, and storage compatibility.
 4. Set `VERSION` to the release number without the `v` prefix and prepare release notes. The tag must match that value exactly.

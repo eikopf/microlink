@@ -24,9 +24,10 @@ The application owns the client instance and serializes lifecycle calls. If `mic
 
 The [minimal example](examples/minimal) connects Wi-Fi, synchronizes the clock, and starts the client. Its defaults match the tested S3 board. Flash and PSRAM settings must match the target hardware.
 
-With ESP-IDF 5.5.2 loaded, from the checkout:
+The Nix development shell supplies the pinned ESP-IDF toolchain. From the checkout:
 
 ```sh
+nix develop
 cd examples/minimal
 idf.py set-target esp32s3
 idf.py menuconfig
@@ -34,17 +35,10 @@ idf.py build
 idf.py -p PORT flash monitor
 ```
 
-Wi-Fi and enrollment credentials are configured in the MicroLink menu. `PORT` is the board's serial port. The example opens no application server; application traffic must be added separately.
+Wi-Fi and enrollment credentials are configured in the MicroLink menu. `PORT` is the board's serial port. The example opens no application server; application traffic must be added separately. `nix flake check` runs host tests and a firmware build with dummy credentials. [Build commands and outputs](docs/build.md).
 
-## Limitations
+The project uses the `v0.x.y` release series. APIs, configuration, and persisted state may change between releases. [Open work](docs/open-work.md) tracks missing features, correctness work, and release qualification.
 
-The project uses the `v0.x.y` release series. APIs, configuration, and persisted state may change between releases.
-
-- IPv6 and Tailnet Lock are unsupported. Receive filtering rejects IPv4 fragments, options, and unsupported policy constraints.
-- The relay pool holds one home connection and two destination connections. Slow connection setup can delay traffic to other regions.
-- Custom coordinators require HTTPS. Full Headscale enrollment has not been validated.
-- Private keys are stored in NVS. The library does not configure flash encryption, Secure Boot, or debug-access restrictions. Firmware also contains any build-time credentials.
-
-Direct and relayed transfers have been tested, including an OPDS catalog and EPUB download. [Validation coverage](TESTING_GUIDE.md) and [detailed limitations](docs/limitations.md) describe the tested paths and remaining gaps.
+Direct and relayed transfers have been tested, including an OPDS catalog and EPUB download. [Validation coverage](TESTING_GUIDE.md) describes the tested paths and remaining gaps.
 
 MIT license; see [LICENSE](LICENSE). Derived from MicroLink and the client vendored in esphome-tailscale; [fork provenance](docs/fork.md). Not affiliated with Tailscale Inc.
