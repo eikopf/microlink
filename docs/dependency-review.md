@@ -6,7 +6,7 @@ Review date: 2026-10-11. The source snapshots below establish the comparison bas
 
 Keep `wireguard-lwip` vendored and maintain the ESP-IDF and Tailscale adaptations in this repository. Track upstream changes and import reviewed fixes with regression tests. An unmodified external dependency cannot supply the current relay callbacks, external UDP transport, peer management, allocation behavior, and shutdown integration. A replacement would require another integration and hardware qualification cycle.
 
-This decision does not establish that the inherited implementation is secure. Replay arithmetic, timestamp generation, previous-key expiry, and missing protocol tests require work before a stable release. [Open work](open-work.md) defines the completion criteria.
+This decision does not establish that the inherited implementation is secure. Local fixes now address replay arithmetic, timestamp generation, key expiry, and other protocol defects. Qualification and legacy migration work remain before a stable release. [Open work](open-work.md) defines the completion criteria.
 
 ## Candidates
 
@@ -20,19 +20,23 @@ This decision does not establish that the inherited implementation is secure. Re
 
 ## Local delta
 
-After line-ending normalization, the current `wireguard.c` matches the reviewed smartalock revision exactly. Seven files under `src` differ or are added, totaling 1,030 additions and 103 deletions in that comparison. Most changes are in `wireguardif.c`. The comparison revision is not a proven historical import base.
+At fork revision `1b0c0c47994576b2641c249fd6e9488fb44849a6`, line-ending-normalized `wireguard.c` matched the reviewed smartalock revision exactly. Seven files under `src` differed or were added, totaling 1,030 additions and 103 deletions in that baseline comparison. Most changes are in `wireguardif.c`. The comparison revision is not a proven historical import base.
 
 The local changes add ESP32 time and random providers, compatibility definitions, configurable peer storage, PSRAM allocation, external transport hooks, relay integration, periodic processing, and resource cleanup. The selected cryptographic backend is the reference C implementation. Licenses and original source notices remain in the component.
 
 `components/wireguard_lwip` is now a regular directory alongside `components/microlink`. Previously it was a symlink to a nested copy inside the client component. The relocation preserves every existing file byte for byte. Consumers must supply the common `components` directory to ESP-IDF; consumers that address the old nested path need an update.
 
-## Findings
+## Findings at the comparison baseline
 
 The replay helper stores a counter difference in `uint32_t` despite using 64-bit packet counters. A local test compiled the production helper with address and undefined-behavior sanitizers and reproduced acceptance of an already accepted counter after a large jump. This is a correctness defect in the inherited helper, also present in the reviewed smartalock source. The test does not measure practical attack feasibility or bypass packet authentication.
 
 The timestamp provider adds boot uptime to a wall-clock sample taken during client initialization. Delayed initialization therefore advances emitted time beyond the actual wall clock. The fallback of adding one day to a persisted base does not cover longer sessions or failed writes. Reboot and storage-failure tests are required. Independent clients provide useful test designs, described in the [survey](implementation-survey.md).
 
 The [previous-key cleanup in droscy](https://github.com/droscy/esp_wireguard/blob/9b7660fed27151abdcbf32b43861044cf4a32497/src/wireguardif.c) is absent from this fork's periodic paths. Expired previous state can remain marked valid after current-key cleanup, while peer status tests either keypair's validity. This requires a focused status and key-lifecycle regression, not a wholesale wrapper replacement.
+
+## Subsequent local fixes
+
+The [protocol fixes](protocol-fixes.md) change `wireguard.c`, `wireguardif.c`, the ESP32 timestamp provider, and the reference C X25519 input decoder. They add checked timestamp persistence, replay validation before receive-side mutations, independent key and handshake expiry, corrected index allocation and rate limiting, and X25519 coordinate masking and aligned input access. Original notices remain intact. The changes have focused regression tests; they are not an upstream source refresh. Host tests now include RFC X25519 and BLAKE2s vectors. Legacy migration, complete handshake fixtures, and malformed-map failure handling remain open.
 
 ## Update policy
 

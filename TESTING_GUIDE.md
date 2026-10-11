@@ -10,7 +10,7 @@ For a host-only run:
 nix develop --command tests/run-host-tests
 ```
 
-The suites exercise receive filtering, coordinator URL parsing, node-key storage, registration framing, network-switch ownership, and AT socket address validation. Platform stubs cover selected failure paths; they do not model RTOS scheduling or modem behavior.
+The suites exercise receive filtering, coordinator URL parsing, node-key storage, registration framing, network-switch ownership, AT socket address validation, WireGuard transport and handshake state, and persistent timestamp allocation. Platform stubs cover selected failure paths; they do not model RTOS scheduling or modem behavior. [Protocol coverage and migration limits](docs/protocol-fixes.md).
 
 ## Firmware build
 
@@ -28,4 +28,4 @@ ESPHome builds of the patched source passed for S3 Quad PSRAM and C3. A cellular
 
 Before a release, repeat affected tests against the exact release candidate. Evidence from the earlier harness does not automatically cover later code changes. [Open work](docs/open-work.md).
 
-The standalone extraction passes all six host sanitizer suites and links the minimal S3 example with the client, coordinator, DERP, and WireGuard manager present in the ELF. The build-only image is approximately 0.99 MB with ESP-IDF 5.5.2. Existing unused-variable/function warnings remain in inherited code. GitHub Actions runs `nix flake check` with the committed lock file.
+The standalone extraction links the minimal S3 example with the client, coordinator, DERP, and WireGuard manager present in the ELF. The build-only image is approximately 0.99 MB with ESP-IDF 5.5.2. Existing unused-variable/function warnings remain in inherited code. GitHub Actions runs `nix flake check` with the committed lock file.
