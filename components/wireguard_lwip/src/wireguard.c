@@ -149,6 +149,7 @@ struct wireguard_peer *peer_lookup_by_handshake(struct wireguard_device *device,
 	for (x=0; x < WIREGUARD_MAX_PEERS; x++) {
 		tmp = &device->peers[x];
 		if (tmp->valid) {
+			wireguard_expire_handshake(tmp);
 			if (tmp->handshake.valid && tmp->handshake.initiator && (tmp->handshake.local_index == receiver)) {
 				result = tmp;
 				break;
@@ -320,8 +321,9 @@ static void wireguard_kdf3(uint8_t *tau1, uint8_t *tau2, uint8_t *tau3, const ui
 bool wireguard_check_replay(struct wireguard_keypair *keypair, uint64_t seq) {
 	// Implementation of packet replay window - as per RFC2401
 	// Adapted from code in Appendix C at https://tools.ietf.org/html/rfc2401
-	uint32_t diff;
+	uint64_t diff;
 	bool result = false;
+	if (seq >= REJECT_AFTER_MESSAGES) return false;
 	size_t ReplayWindowSize = sizeof(keypair->replay_bitmap) * CHAR_BIT; // 32 bits
 
 	// WireGuard data packet counter starts from 0 but algorithm expects packet numbers to start from 1
@@ -395,7 +397,7 @@ static uint32_t wireguard_generate_unique_index(struct wireguard_device *device)
 					(result == peer->prev_keypair.local_index) ||
 					(result == peer->next_keypair.local_index) ||
 					(result == peer->handshake.local_index);
-
+			if (existing) break;
 		}
 	} while (existing);
 
@@ -450,13 +452,41 @@ void keypair_destroy(struct wireguard_keypair *keypair) {
 	keypair->valid = false;
 }
 
-void keypair_update(struct wireguard_peer *peer, struct wireguard_keypair *received_keypair) {
+struct wireguard_keypair *keypair_update(struct wireguard_peer *peer, struct wireguard_keypair *received_keypair) {
 	bool key_is_next = (received_keypair == &peer->next_keypair);
 	if (key_is_next) {
 		peer->prev_keypair = peer->curr_keypair;
 		peer->curr_keypair = peer->next_keypair;
 		keypair_destroy(&peer->next_keypair);
+		return &peer->curr_keypair;
 	}
+	return received_keypair;
+}
+
+bool wireguard_keypair_expired(const struct wireguard_keypair *keypair) {
+    return keypair->valid &&
+        (wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME) ||
+         keypair->sending_counter >= REJECT_AFTER_MESSAGES);
+}
+
+void wireguard_destroy_handshake(struct wireguard_peer *peer) {
+    crypto_zero(&peer->handshake, sizeof(peer->handshake));
+    crypto_zero(peer->handshake_mac1, sizeof(peer->handshake_mac1));
+    peer->handshake_mac1_valid = false;
+}
+
+void wireguard_expire_handshake(struct wireguard_peer *peer) {
+    if (peer->handshake.valid && wireguard_expired(peer->handshake.created_millis, REJECT_AFTER_TIME * 3)) {
+        wireguard_destroy_handshake(peer);
+    }
+}
+
+void wireguard_expire_keys(struct wireguard_peer *peer) {
+    wireguard_expire_handshake(peer);
+    struct wireguard_keypair *keys[] = { &peer->curr_keypair, &peer->prev_keypair, &peer->next_keypair };
+    for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        if (wireguard_keypair_expired(keys[i])) keypair_destroy(keys[i]);
+    }
 }
 
 static void add_new_keypair(struct wireguard_peer *peer, struct wireguard_keypair new_keypair) {
@@ -474,7 +504,9 @@ static void add_new_keypair(struct wireguard_peer *peer, struct wireguard_keypai
 	}
 }
 
-void wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
+bool wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
+	wireguard_expire_handshake(peer);
+	if (!peer->handshake.valid) return false;
 	struct wireguard_handshake *handshake = &peer->handshake;
 	struct wireguard_keypair new_keypair;
 
@@ -503,16 +535,11 @@ void wireguard_start_session(struct wireguard_peer *peer, bool initiator) {
 
 	new_keypair.valid = true;
 
-	// Eprivi = Epubi = Eprivr = Epubr = Ci = Cr := E
-	crypto_zero(handshake->ephemeral_private, WIREGUARD_PUBLIC_KEY_LEN);
-	crypto_zero(handshake->remote_ephemeral, WIREGUARD_PUBLIC_KEY_LEN);
-	crypto_zero(handshake->hash, WIREGUARD_HASH_LEN);
-	crypto_zero(handshake->chaining_key, WIREGUARD_HASH_LEN);
-	handshake->remote_index = 0;
-	handshake->local_index = 0;
-	handshake->valid = false;
+	wireguard_destroy_handshake(peer);
 
 	add_new_keypair(peer, new_keypair);
+	crypto_zero(&new_keypair, sizeof(new_keypair));
+	return true;
 }
 
 uint8_t wireguard_get_message_type(const uint8_t *data, size_t len) {
@@ -611,7 +638,8 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 
 					// Check that timestamp is increasing and we haven't had too many initiations (should only get one per peer every 5 seconds max?)
 					replay = (memcmp(t, peer->greatest_timestamp, WIREGUARD_TAI64N_LEN) <= 0); // tai64n is big endian so we can use memcmp to compare
-					rate_limit = (peer->last_initiation_rx - now) < (1000 / MAX_INITIATIONS_PER_SECOND);
+					rate_limit = !crypto_equal(peer->greatest_timestamp, zero_key, WIREGUARD_TAI64N_LEN) &&
+						(uint32_t)(now - peer->last_initiation_rx) < (1000 / MAX_INITIATIONS_PER_SECOND);
 
 					if (!replay && !rate_limit) {
 						// Success! Copy everything to peer
@@ -624,6 +652,7 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 						memcpy(handshake->hash, hash, WIREGUARD_HASH_LEN);
 						memcpy(handshake->chaining_key, chaining_key, WIREGUARD_HASH_LEN);
 						handshake->remote_index = msg->sender;
+						handshake->created_millis = now;
 						handshake->valid = true;
 						handshake->initiator = false;
 						ret_peer = peer;
@@ -653,6 +682,7 @@ struct wireguard_peer *wireguard_process_initiation_message(struct wireguard_dev
 }
 
 bool wireguard_process_handshake_response(struct wireguard_device *device, struct wireguard_peer *peer, struct message_handshake_response *src) {
+	wireguard_expire_handshake(peer);
 	struct wireguard_handshake *handshake = &peer->handshake;
 
 	bool result = false;
@@ -768,6 +798,7 @@ bool wireguard_create_handshake_initiation(struct wireguard_device *device, stru
 
 	struct wireguard_handshake *handshake = &peer->handshake;
 
+	if (!wireguard_tai64n_now(timestamp)) return false;
 	memset(dst, 0, sizeof(struct message_handshake_initiation));
 
 	// Ci := Hash(Construction) (precalculated hash)
@@ -810,7 +841,6 @@ bool wireguard_create_handshake_initiation(struct wireguard_device *device, stru
 			wireguard_kdf2(handshake->chaining_key, key, handshake->chaining_key, peer->public_key_dh, WIREGUARD_PUBLIC_KEY_LEN);
 
 			// msg.timestamp := AEAD(k, 0, Timestamp(), Hi)
-			wireguard_tai64n_now(timestamp);
 			wireguard_aead_encrypt(dst->enc_timestamp, timestamp, WIREGUARD_TAI64N_LEN, handshake->hash, WIREGUARD_HASH_LEN, 0, key);
 
 			// Hi := Hash(Hi || msg.timestamp)
@@ -819,6 +849,7 @@ bool wireguard_create_handshake_initiation(struct wireguard_device *device, stru
 			dst->type = MESSAGE_HANDSHAKE_INITIATION;
 			dst->sender = wireguard_generate_unique_index(device);
 
+			handshake->created_millis = wireguard_sys_now();
 			handshake->valid = true;
 			handshake->initiator = true;
 			handshake->local_index = dst->sender;
@@ -850,6 +881,7 @@ bool wireguard_create_handshake_initiation(struct wireguard_device *device, stru
 }
 
 bool wireguard_create_handshake_response(struct wireguard_device *device, struct wireguard_peer *peer, struct message_handshake_response *dst) {
+	wireguard_expire_handshake(peer);
 	struct wireguard_handshake *handshake = &peer->handshake;
 	uint8_t key[WIREGUARD_SESSION_KEY_LEN];
 	uint8_t dh_calculation[WIREGUARD_PUBLIC_KEY_LEN];
@@ -1007,7 +1039,9 @@ void wireguard_encrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, 
 }
 
 bool wireguard_decrypt_packet(uint8_t *dst, const uint8_t *src, size_t src_len, uint64_t counter, struct wireguard_keypair *keypair) {
-	return wireguard_aead_decrypt(dst, src, src_len, NULL, 0, counter, keypair->receiving_key);
+	if (src_len < WIREGUARD_AUTHTAG_LEN || counter >= REJECT_AFTER_MESSAGES) return false;
+	if (!wireguard_aead_decrypt(dst, src, src_len, NULL, 0, counter, keypair->receiving_key)) return false;
+	return wireguard_check_replay(keypair, counter);
 }
 
 bool wireguard_base64_decode(const char *str, uint8_t *out, size_t *outlen) {

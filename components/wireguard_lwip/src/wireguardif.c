@@ -499,7 +499,7 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 	WG_DEBUG("[WG] Processing handshake response from %s:%u\n",
 		ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
 
-	if (wireguard_process_handshake_response(device, peer, response)) {
+	if (wireguard_process_handshake_response(device, peer, response) && wireguard_start_session(peer, true)) {
 		// Packet is good — identify the peer
 		uint8_t wg_idx = wireguard_peer_index(device, peer);
 		ESP_LOGW(TAG, "[WG] *** HANDSHAKE COMPLETE! wg_idx=%u key=%02x%02x%02x%02x "
@@ -511,7 +511,6 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 		// Update the peer location
 		update_peer_addr(peer, addr, port);
 
-		wireguard_start_session(peer, true);
 		peer->handshake_attempts = 0;  // session up, reset retry counter
 		ESP_LOGW(TAG, "[WG] Session started, sending keepalive to %s:%u",
 		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip), peer->port);
@@ -573,8 +572,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 	if (keypair) {
 		if (
 				(keypair->receiving_valid) &&
-				!wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME) &&
-				(keypair->sending_counter < REJECT_AFTER_MESSAGES)
+				!wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME)
 
 		) {
 
@@ -601,7 +599,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					peer->last_rx = now;
 
 					// Might need to shuffle next key --> current keypair
-					keypair_update(peer, keypair);
+					keypair = keypair_update(peer, keypair);
 
 					// Check to see if we should rekey
 					if (keypair->initiator && wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME - peer->keepalive_interval - REKEY_TIMEOUT)) {
@@ -614,8 +612,8 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 					if (pbuf->tot_len > 0) {
 						//4a. Once the packet payload is decrypted, the interface has a plaintext packet. If this is not an IP packet, it is dropped.
 						iphdr = (struct ip_hdr *)pbuf->payload;
-						// Check for packet replay / dupes
-						if (wireguard_check_replay(keypair, nonce)) {
+						// Require a complete header before accessing its addresses.
+						if (pbuf->tot_len >= sizeof(struct ip_hdr)) {
 
 							// 4b. Otherwise, WireGuard checks to see if the source IP address of the plaintext inner-packet routes correspondingly in the cryptokey routing table
 							// Also check packet length!
@@ -653,13 +651,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 								}
 							}
 #endif /* LWIP_IPV4 */
-#if LWIP_IPV6
-							if (IPH_V(iphdr) == 6) {
-								// TODO: IPV6 support for route filtering
-								header_len = PP_NTOHS(IPH_LEN(iphdr));
-								dest_ok = true;
-							}
-#endif /* LWIP_IPV6 */
+
 							if (header_len <= pbuf->tot_len) {
 
 								// 5. If the plaintext packet has not been dropped, it is inserted into the receive queue of the wg0 interface.
@@ -690,7 +682,7 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 								       (unsigned)header_len, (unsigned)pbuf->tot_len);
 							}
 						} else {
-							// This is a duplicate packet / replayed / too far out of order
+							// The decrypted packet is too short for an IP header.
 						}
 					} else {
 						// This was a keep-alive packet
@@ -748,7 +740,7 @@ static void wireguardif_send_handshake_response(struct wireguard_device *device,
 
 	if (wireguard_create_handshake_response(device, peer, &packet)) {
 
-		wireguard_start_session(peer, false);
+		if (!wireguard_start_session(peer, false)) return;
 		peer->handshake_attempts = 0;  // session up, reset retry counter
 
 		// Send this packet out!
@@ -1081,6 +1073,8 @@ err_t wireguardif_disconnect(struct netif *netif, u8_t peer_index) {
 	if (result == ERR_OK) {
 		// Set the flag that we want to try connecting
 		peer->active = false;
+		peer->send_handshake = false;
+		wireguard_destroy_handshake(peer);
 		// Wipe out current keys
 		keypair_destroy(&peer->next_keypair);
 		keypair_destroy(&peer->curr_keypair);
@@ -1094,7 +1088,8 @@ err_t wireguardif_peer_is_up(struct netif *netif, u8_t peer_index, ip_addr_t *cu
 	struct wireguard_peer *peer;
 	err_t result = wireguardif_lookup_peer(netif, peer_index, &peer);
 	if (result == ERR_OK) {
-		if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
+		if ((peer->curr_keypair.valid && !wireguard_keypair_expired(&peer->curr_keypair)) ||
+		    (peer->prev_keypair.valid && !wireguard_keypair_expired(&peer->prev_keypair))) {
 			result = ERR_OK;
 		} else {
 			result = ERR_CONN;
@@ -1272,48 +1267,6 @@ static bool should_send_keepalive(struct wireguard_peer *peer) {
 	return result;
 }
 
-static bool should_destroy_current_keypair(struct wireguard_peer *peer) {
-	bool result = false;
-	if (peer->curr_keypair.valid &&
-			(wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME) ||
-			(peer->curr_keypair.sending_counter >= REJECT_AFTER_MESSAGES))
-		) {
-		result = true;
-		/* Throughput-collapse diag: this is the moment encrypted traffic
-		 * actually stops flowing for a peer. Log endpoint + reason. */
-		bool by_age = wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME);
-		ESP_LOGW(TAG, "[WG_DESTROY] peer=%02x%02x%02x%02x reason=%s "
-		       "age_ms=%lu counter=%lu ep=%s:%u",
-		       peer->public_key[0], peer->public_key[1],
-		       peer->public_key[2], peer->public_key[3],
-		       by_age ? "age" : "counter",
-		       (unsigned long)(wireguard_sys_now() - peer->curr_keypair.keypair_millis),
-		       (unsigned long)peer->curr_keypair.sending_counter,
-		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
-		       peer->port);
-	}
-	return result;
-}
-
-static bool should_reset_peer(struct wireguard_peer *peer) {
-	bool result = false;
-	if (peer->curr_keypair.valid && (wireguard_expired(peer->curr_keypair.keypair_millis, REJECT_AFTER_TIME * 3))) {
-		result = true;
-		/* Throughput-collapse diag: peer reset wipes endpoint back to connect_ip
-		 * (often 0.0.0.0 for DERP-only peers). Catch this BEFORE the wipe. */
-		ESP_LOGW(TAG, "[WG_RESET] peer=%02x%02x%02x%02x age_ms=%lu ep=%s:%u "
-		       "-> reverting to connect_ip=%s:%u",
-		       peer->public_key[0], peer->public_key[1],
-		       peer->public_key[2], peer->public_key[3],
-		       (unsigned long)(wireguard_sys_now() - peer->curr_keypair.keypair_millis),
-		       ip_addr_isany(&peer->ip) ? "DERP" : ipaddr_ntoa(&peer->ip),
-		       peer->port,
-		       ip_addr_isany(&peer->connect_ip) ? "DERP" : ipaddr_ntoa(&peer->connect_ip),
-		       peer->connect_port);
-	}
-	return result;
-}
-
 static void wireguardif_tmr(void *arg) {
 	struct wireguard_device *device = (struct wireguard_device *)arg;
 	if (!device || !device->netif) {
@@ -1330,21 +1283,7 @@ static void wireguardif_tmr(void *arg) {
 		peer = &device->peers[x];
 		if (peer->valid) {
 			// Do we need to rekey / send a handshake?
-			if (should_reset_peer(peer)) {
-				// Nothing back for too long - we should wipe out all crypto state
-				keypair_destroy(&peer->next_keypair);
-				keypair_destroy(&peer->curr_keypair);
-				keypair_destroy(&peer->prev_keypair);
-				// TODO: Also destroy handshake?
-
-				// Revert back to default IP/port if these were altered
-				peer->ip = peer->connect_ip;
-				peer->port = peer->connect_port;
-			}
-			if (should_destroy_current_keypair(peer)) {
-				// Destroy current keypair
-				keypair_destroy(&peer->curr_keypair);
-			}
+			wireguard_expire_keys(peer);
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
 			}
@@ -1384,16 +1323,7 @@ void wireguardif_periodic(struct netif *netif) {
 		int peer_idx = (s_next_hs_peer_idx + x) % WIREGUARD_MAX_PEERS;
 		peer = &device->peers[peer_idx];
 		if (peer->valid) {
-			if (should_reset_peer(peer)) {
-				keypair_destroy(&peer->next_keypair);
-				keypair_destroy(&peer->curr_keypair);
-				keypair_destroy(&peer->prev_keypair);
-				peer->ip = peer->connect_ip;
-				peer->port = peer->connect_port;
-			}
-			if (should_destroy_current_keypair(peer)) {
-				keypair_destroy(&peer->curr_keypair);
-			}
+			wireguard_expire_keys(peer);
 			if (should_send_keepalive(peer)) {
 				wireguardif_send_keepalive(device, peer);
 			}

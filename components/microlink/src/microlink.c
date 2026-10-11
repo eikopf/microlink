@@ -238,33 +238,10 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         return NULL;
     }
 
-    /* Initialize the TAI64N timestamp base used by wireguard-lwip handshake
-     * inits. Peers reject any init timestamp <= the one we sent in our
-     * previous boot (replay-attack guard in the WireGuard spec). We persist
-     * a per-boot counter in NVS so this boot's base + uptime is always
-     * strictly greater than the previous boot's max-emitted timestamp.
-     * If real wall-clock has synced (SNTP), prefer that. */
-    {
-        uint64_t base_seconds = 0;
-        time_t wallclock = 0;
-        time(&wallclock);
-        if (wallclock > 1700000000) {
-            base_seconds = (uint64_t)wallclock;
-        } else {
-            nvs_handle_t h;
-            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-                uint64_t prev = 0;
-                size_t sz = sizeof(prev);
-                nvs_get_blob(h, "wg_tai_base", &prev, &sz);
-                base_seconds = prev + 86400ULL; /* +1 day per boot */
-                nvs_set_blob(h, "wg_tai_base", &base_seconds, sizeof(base_seconds));
-                nvs_commit(h);
-                nvs_close(h);
-            }
-        }
-        wireguard_set_tai64n_base_seconds(base_seconds);
-        ESP_LOGI(TAG, "TAI64N base seconds set to %llu (wallclock=%lld)",
-                 (unsigned long long)base_seconds, (long long)wallclock);
+    if (!wireguard_tai64n_init()) {
+        ESP_LOGE(TAG, "Cannot reserve persistent WireGuard timestamp epoch");
+        free(ml);
+        return NULL;
     }
 
     /* Initialize peer NVS cache */

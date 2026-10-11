@@ -64,19 +64,11 @@ uint32_t wireguard_sys_now();
 // Fill the supplied buffer with random data - random data is used for generating new session keys periodically
 void wireguard_random_bytes(void *bytes, size_t size);
 
-// Get the current time in tai64n format - 8 byte seconds, 4 byte nano sub-second - see https://cr.yp.to/libtai/tai64.html for details
-// Output buffer passed is 12 bytes
-// The Wireguard implementation doesn't strictly need this to be a time, but instead an increasing value
-// The remote end of the Wireguard tunnel will use this value in handshake replay detection
-void wireguard_tai64n_now(uint8_t *output);
+// Reserve a persistent boot epoch before any handshake can be emitted.
+bool wireguard_tai64n_init(void);
 
-// Set the base seconds offset added to esp_timer_get_time() inside
-// wireguard_tai64n_now(). The higher layer must supply a value that is
-// strictly greater than the maximum timestamp emitted in any previous
-// boot (otherwise peers reject our handshakes as replays). Real SNTP
-// wall-clock is ideal; an NVS-persisted per-boot counter is the
-// fallback used by microlink when the clock has not yet synced.
-void wireguard_set_tai64n_base_seconds(uint64_t base_seconds);
+// Emit a strictly increasing 12-byte TAI64N value; false leaves output unchanged.
+bool wireguard_tai64n_now(uint8_t *output);
 
 // Is the system under load - i.e. should we generate cookie reply message in response to initiation messages
 bool wireguard_is_under_load();

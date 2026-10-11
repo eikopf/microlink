@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+test_dir="$(mktemp -d)"
+trap 'rm -rf "$test_dir"' EXIT
+src="$repo_dir/components/wireguard_lwip/src"
+"${CC:-cc}" -std=c11 -Wall -Wextra -g -DWIREGUARD_CRYPTO_REFC=1 \
+    -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I "$repo_dir/tests/wireguard_stubs" -I "$src" \
+    "$repo_dir/tests/wireguard_test.c" "$src/wireguard.c" "$src/crypto.c" \
+    "$src"/crypto/refc/{blake2s,chacha20,chacha20poly1305,poly1305-donna,x25519}.c \
+    -o "$test_dir/wireguard-test"
+"$test_dir/wireguard-test"
+python3 "$repo_dir/tests/extract-wireguard-receive.py" "$src/wireguardif.c" "$test_dir/wireguard_receive_function.inc"
+"${CC:-cc}" -std=c11 -Wall -Wextra -g -DWIREGUARD_CRYPTO_REFC=1 \
+    -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I "$repo_dir/tests/wireguard_stubs" -I "$src" -I "$test_dir" \
+    "$repo_dir/tests/wireguard_receive_test.c" "$src/wireguard.c" "$src/crypto.c" \
+    "$src"/crypto/refc/{blake2s,chacha20,chacha20poly1305,poly1305-donna,x25519}.c \
+    -o "$test_dir/wireguard-receive-test"
+"$test_dir/wireguard-receive-test"

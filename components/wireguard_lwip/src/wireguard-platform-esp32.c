@@ -5,7 +5,11 @@
 
 #include "wireguard-platform.h"
 #include "esp_random.h"
-#include "esp_timer.h"
+#include "wireguard-timestamp.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "nvs.h"
+#include <time.h>
 #include "lwip/sys.h"
 #include <string.h>
 
@@ -18,50 +22,65 @@ uint32_t wireguard_sys_now() {
     return sys_now();
 }
 
-/* WireGuard handshake init carries a TAI64N timestamp the peer compares
- * against stored greatest_timestamp; anything <= stored is treated as
- * replay and DROPped. ESP boot uptime restarts from 0 each reboot, so
- * unless we add a monotonic offset the peer rejects every handshake we
- * send until its replay-state expires.
- *
- * The base offset is supplied by the higher layer (microlink) via
- * wireguard_set_tai64n_base_seconds() because that layer already owns
- * NVS access and can decide whether to use SNTP wall clock or a
- * persisted per-boot counter. */
-static uint64_t s_tai_base_seconds = 0;
+/* One durable epoch per boot; client recreation must not reset the sequence. */
+static wg_timestamp_t timestamp_state;
+static StaticSemaphore_t timestamp_mutex_storage;
+static SemaphoreHandle_t timestamp_mutex;
+static portMUX_TYPE timestamp_init_lock = portMUX_INITIALIZER_UNLOCKED;
 
-void wireguard_set_tai64n_base_seconds(uint64_t base_seconds) {
-    s_tai_base_seconds = base_seconds;
+static SemaphoreHandle_t get_timestamp_mutex(void) {
+    portENTER_CRITICAL(&timestamp_init_lock);
+    if (!timestamp_mutex) timestamp_mutex = xSemaphoreCreateMutexStatic(&timestamp_mutex_storage);
+    portEXIT_CRITICAL(&timestamp_init_lock);
+    return timestamp_mutex;
 }
 
-void wireguard_tai64n_now(uint8_t *output) {
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t seconds = s_tai_base_seconds + (now_us / 1000000ULL);
-    uint32_t nanoseconds = (now_us % 1000000ULL) * 1000;
-    static uint64_t last_log = 0;
-    if (seconds - last_log > 10) {
-        printf("[TAI64N] base=%llu now=%llu\n",
-               (unsigned long long)s_tai_base_seconds,
-               (unsigned long long)seconds);
-        last_log = seconds;
+static bool reserve_epoch(uint64_t minimum, uint64_t *epoch, void *context) {
+    (void)context;
+    nvs_handle_t nvs;
+    if (nvs_open("microlink", NVS_READWRITE, &nvs) != ESP_OK) return false;
+    uint64_t previous = 0;
+    size_t size = sizeof(previous);
+    esp_err_t result = nvs_get_blob(nvs, "wg_tai_epoch", &previous, &size);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        size = sizeof(previous);
+        result = nvs_get_blob(nvs, "wg_tai_base", &previous, &size);
     }
+    if (result == ESP_ERR_NVS_NOT_FOUND) previous = 0;
+    else if (result != ESP_OK || size != sizeof(previous)) {
+        nvs_close(nvs);
+        return false;
+    }
+    if (previous >= WG_TIMESTAMP_MAX_EPOCH || minimum > WG_TIMESTAMP_MAX_EPOCH) {
+        nvs_close(nvs);
+        return false;
+    }
+    uint64_t next = previous + 1;
+    if (next < minimum) next = minimum;
+    result = nvs_set_blob(nvs, "wg_tai_epoch", &next, sizeof(next));
+    if (result == ESP_OK) result = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (result != ESP_OK) return false;
+    *epoch = next;
+    return true;
+}
 
-    /* TAI64 base: 2^62 + Unix time (TAI is +10s from UTC at epoch). */
-    seconds += 0x400000000000000AULL;
+bool wireguard_tai64n_init(void) {
+    SemaphoreHandle_t mutex = get_timestamp_mutex();
+    if (!mutex || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) return false;
+    time_t now = time(NULL);
+    bool result = wg_timestamp_init(&timestamp_state, now > 0 ? (uint64_t)now : 0,
+                                    reserve_epoch, NULL);
+    xSemaphoreGive(mutex);
+    return result;
+}
 
-    output[0] = (seconds >> 56) & 0xFF;
-    output[1] = (seconds >> 48) & 0xFF;
-    output[2] = (seconds >> 40) & 0xFF;
-    output[3] = (seconds >> 32) & 0xFF;
-    output[4] = (seconds >> 24) & 0xFF;
-    output[5] = (seconds >> 16) & 0xFF;
-    output[6] = (seconds >> 8) & 0xFF;
-    output[7] = seconds & 0xFF;
-
-    output[8]  = (nanoseconds >> 24) & 0xFF;
-    output[9]  = (nanoseconds >> 16) & 0xFF;
-    output[10] = (nanoseconds >> 8) & 0xFF;
-    output[11] = nanoseconds & 0xFF;
+bool wireguard_tai64n_now(uint8_t *output) {
+    SemaphoreHandle_t mutex = get_timestamp_mutex();
+    if (!mutex || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) return false;
+    bool result = wg_timestamp_next(&timestamp_state, output);
+    xSemaphoreGive(mutex);
+    return result;
 }
 
 /* ============================================================================

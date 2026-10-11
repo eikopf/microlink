@@ -20,19 +20,11 @@ uint32_t wireguard_sys_now() {
 	return sys_now();
 }
 
-// CHANGE THIS TO GET THE ACTUAL UNIX TIMESTMP IN MILLIS - HANDSHAKES WILL FAIL IF THIS DOESN'T INCREASE EACH TIME CALLED
-void wireguard_tai64n_now(uint8_t *output) {
-	// See https://cr.yp.to/libtai/tai64.html
-	// 64 bit seconds from 1970 = 8 bytes
-	// 32 bit nano seconds from current second
-
-	uint64_t millis = sys_now();
-
-	// Split into seconds offset + nanos
-	uint64_t seconds = 0x400000000000000aULL + (millis / 1000);
-	uint32_t nanos = (millis % 1000) * 1000;
-	U64TO8_BIG(output + 0, seconds);
-	U32TO8_BIG(output + 8, nanos);
+// A port must supply durable monotonic timestamps before enabling handshakes.
+bool wireguard_tai64n_init(void) { return false; }
+bool wireguard_tai64n_now(uint8_t *output) {
+    (void)output;
+    return false;
 }
 
 bool wireguard_is_under_load() {
