@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+test_dir="$(mktemp -d)"
+trap 'rm -rf "$test_dir"' EXIT
+src="$repo_dir/components/wireguard_lwip/src"
+"${CC:-cc}" -std=c11 -Wall -Wextra -g \
+    -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I "$src" "$repo_dir/tests/crypto_test.c" "$src/crypto.c" \
+    "$src"/crypto/refc/{blake2s,chacha20,chacha20poly1305,poly1305-donna,x25519}.c \
+    -o "$test_dir/crypto-test"
+"$test_dir/crypto-test"

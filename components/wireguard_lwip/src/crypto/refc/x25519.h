@@ -46,12 +46,9 @@ extern const unsigned char X25519_BASE_POINT[X25519_BYTES];
  * meaning that one party might steer the key so that the other party's
  * contribution doesn't matter, or contributes only a little entropy.
  *
- * WARNING: however, this function differs from RFC 7748 in another way:
- * it pays attention to the high bit base[EC_PUBLIC_BYTES-1] & 0x80, but
- * RFC 7748 says to ignore this bit.  For compatibility with RFC 7748,
- * you must also clear this bit by running base[EC_PUBLIC_BYTES-1] &= 0x7F.
- * This library won't clear it for you because it takes the base point as
- * const, and (depending on build flags) dosen't copy it.
+ * With clamp set, the copied input coordinate has bit 255 cleared as
+ * required by RFC 7748. The caller's input remains unchanged. With clamp
+ * unset, the input coordinate retains its high bit.
  *
  * If clamp==0, or if X25519_INTEROP_SUPPORT_CLAMP==0, then this function
  * always returns 0.

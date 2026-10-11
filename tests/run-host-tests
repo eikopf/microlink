@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
-for suite in control-url nodekey registration filter net-switch at-address; do
+for suite in control-url nodekey registration filter net-switch at-address crypto; do
     "$repo_dir/tests/run-$suite-tests"
 done
