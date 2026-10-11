@@ -1,41 +1,50 @@
 # MicroLink
 
-An experimental Tailscale-compatible client for ESP32 applications using ESP-IDF. It provides an IPv4 WireGuard interface, direct peer discovery, DERP relay transport, and coordinator registration. ESPHome is not required.
+MicroLink connects an ESP32 to a Tailscale network through an ESP-IDF component. The device gets its own tailnet address and can exchange TCP and UDP traffic with peers. Connections use direct WireGuard transport or DERP relays.
 
-This fork maintains the client used by the Crosspoint Tailscale prototype. It derives from [CamM2325/microlink](https://github.com/CamM2325/microlink), [Csontikka/microlink](https://github.com/Csontikka/microlink), and the client vendored in [esphome-tailscale](https://github.com/Csontikka/esphome-tailscale). [Provenance and changes](docs/fork.md).
+The client handles registration, peer discovery, relay connections, and incoming IPv4 access rules from the coordinator. Device identity persists in NVS across restarts. The application supplies the network connection, clock synchronization, credentials, and application protocol.
 
-## Status
+## Hardware and SDK
 
-Development uses the `v0.x.y` release series. APIs, configuration, and persisted state may change. There is no stable release or claim of full Tailscale compatibility.
+The tested configuration is an ESP32-S3 with 4 MB flash and 2 MB Quad PSRAM, running ESP-IDF 5.5.2. ESP32-C3 builds pass, but runtime operation and memory headroom remain unverified. Optional cellular support is inherited and has not been tested on hardware in this fork.
 
-The patched client has run on an ESP32-S3 with 4 MB flash and 2 MB Quad PSRAM using ESP-IDF 5.5.2. Tests cover direct and relayed transfers, selected shutdown and recovery paths, and OPDS catalog parsing and book acquisition. ESP32-C3 has compile coverage; runtime memory headroom remains unverified. [Validation](TESTING_GUIDE.md).
+Memory use depends on peer count, coordinator responses, and active relay connections. The supplied example uses 16 peer slots and 64 KiB control-plane buffers. A peer limit that is too small can exclude the intended server, even when the application only needs one connection. [Capacity and configuration](docs/LARGE_TAILNET.md).
 
-Known limits include IPv4-only receive filtering, bounded peer and policy tables, no Tailnet Lock, and two additional DERP regions beyond the home connection. Slow relay setup can delay other traffic. Private keys in NVS have no physical-access protection supplied by this library. [Limitations](docs/limitations.md).
+## Integration
 
-## Build
+The application adds the checkout's `components` directory to `EXTRA_COMPONENT_DIRS` and declares `microlink` in its component's `REQUIRES`.
 
-With the ESP-IDF 5.5.2 environment loaded:
+After initializing NVS, connecting the uplink, and synchronizing the system clock, the application calls `microlink_init()` with its enrollment key and device name, then `microlink_start()`. Clock synchronization is required for relay certificate validation.
+
+The [C API](components/microlink/include/microlink.h) provides connection status, peer lookup, and TCP and UDP helpers that route traffic through the WireGuard interface. Existing socket-based libraries may need application routing changes to use that interface.
+
+The application owns the client instance and serializes lifecycle calls. If `microlink_stop()` times out, the instance retains live resources and cleanup must be retried before destruction or replacement. Node-key expiry can require a new instance and renewed authorization. [Key recovery](docs/nodekey-recovery.md).
+
+## Example
+
+The [minimal example](examples/minimal) connects Wi-Fi, synchronizes the clock, and starts the client. Its defaults match the tested S3 board. Flash and PSRAM settings must match the target hardware.
+
+With ESP-IDF 5.5.2 loaded, from the checkout:
 
 ```sh
-git clone https://github.com/eikopf/microlink.git
-cd microlink/examples/minimal
+cd examples/minimal
 idf.py set-target esp32s3
 idf.py menuconfig
 idf.py build
+idf.py -p PORT flash monitor
 ```
 
-The minimal example targets the tested 4 MB / 2 MB Quad PSRAM board. Configure Wi-Fi and enrollment credentials in the MicroLink menu. Adjust flash and PSRAM settings for other hardware. Generated `sdkconfig` files are ignored by Git; firmware binaries still contain configured credentials.
+Wi-Fi and enrollment credentials are configured in the MicroLink menu. `PORT` is the board's serial port. The example opens no application server; application traffic must be added separately.
 
-Flash with `idf.py -p PORT flash monitor`, using the board's actual serial port. The example connects Wi-Fi, synchronizes the clock, and starts the client. It does not open an application server.
+## Limitations
 
-## Embed
+The project uses the `v0.x.y` release series. APIs, configuration, and persisted state may change between releases.
 
-Add this checkout's `components` directory to the application's `EXTRA_COMPONENT_DIRS`. Depend on `microlink` from the application component. Initialize NVS and networking, connect the uplink, and synchronize the system clock before calling `microlink_init()` and `microlink_start()`.
+- IPv6 and Tailnet Lock are unsupported. Receive filtering rejects IPv4 fragments, options, and unsupported policy constraints.
+- The relay pool holds one home connection and two destination connections. Slow connection setup can delay traffic to other regions.
+- Custom coordinators require HTTPS. Full Headscale enrollment has not been validated.
+- Private keys are stored in NVS. The library does not configure flash encryption, Secure Boot, or debug-access restrictions. Firmware also contains any build-time credentials.
 
-The application owns the instance and must serialize lifecycle calls. A failed `microlink_stop()` retains live resources; retry cleanup before releasing the owner or starting another instance. See the [public header](components/microlink/include/microlink.h), [architecture](docs/ARCHITECTURE.md), and [key recovery contract](docs/nodekey-recovery.md).
+Direct and relayed transfers have been tested, including an OPDS catalog and EPUB download. [Validation coverage](TESTING_GUIDE.md) and [detailed limitations](docs/limitations.md) describe the tested paths and remaining gaps.
 
-## Development
-
-Run `tests/run-host-tests` with `IDF_PATH` set to ESP-IDF 5.5.2 and a host C compiler with address and undefined-behavior sanitizers. [Release policy](docs/releases.md).
-
-MIT license; original notices and bundled dependency licenses are retained. See [LICENSE](LICENSE). This project is not affiliated with Tailscale Inc.
+MIT license; see [LICENSE](LICENSE). Derived from MicroLink and the client vendored in esphome-tailscale; [fork provenance](docs/fork.md). Not affiliated with Tailscale Inc.
