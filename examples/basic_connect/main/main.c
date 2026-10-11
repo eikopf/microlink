@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief MicroLink v2 Basic Connect + Messaging Example
+ * @brief MicroLink Basic Connect + Messaging Example
  *
  * Connects to a Tailscale network, then:
  * - Listens on UDP port 9000 for incoming messages (logs + echoes them back)
@@ -222,7 +222,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "MicroLink v2 Basic Connect + Messaging Example");
+    ESP_LOGI(TAG, "MicroLink Basic Connect + Messaging Example");
     ESP_LOGI(TAG, "Free heap: %lu bytes (PSRAM: %lu bytes)",
              (unsigned long)esp_get_free_heap_size(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));

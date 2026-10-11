@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Add microlink-v2 component path
+# Add microlink component path
 set(EXTRA_COMPONENT_DIRS
     "../../components"
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(microlink_v2_basic_connect)
+project(microlink_basic_connect)

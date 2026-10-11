@@ -1,4 +1,4 @@
-menu "MicroLink V2 Configuration"
+menu "MicroLink Configuration"
 
     config ML_DERP_TLS_REQUIREMENTS
         bool
@@ -262,7 +262,7 @@ menu "MicroLink V2 Configuration"
     endmenu
 
     menu "Credentials"
-        comment "Configure via: idf.py menuconfig → MicroLink V2 → Credentials"
+        comment "Configure via: idf.py menuconfig → MicroLink → Credentials"
         comment "These values are stored in sdkconfig (git-ignored)."
 
         config ML_WIFI_SSID

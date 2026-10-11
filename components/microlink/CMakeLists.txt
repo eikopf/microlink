@@ -58,3 +58,11 @@ if(DEFINED esp-idf_SOURCE_DIR)
         ${esp-idf_SOURCE_DIR}/components/mbedtls/esp_crt_bundle/include
     )
 endif()
+
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../../VERSION" MICROLINK_VERSION)
+string(STRIP "${MICROLINK_VERSION}" MICROLINK_VERSION)
+if(NOT MICROLINK_VERSION MATCHES "^0\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-dev)?$")
+    message(FATAL_ERROR "VERSION must be a v0.x.y number without the v prefix, optionally ending in -dev")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/../../VERSION")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE MICROLINK_VERSION="${MICROLINK_VERSION}")

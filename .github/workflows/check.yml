@@ -1,0 +1,30 @@
+name: Check
+on:
+  push:
+    branches: ['**']
+    tags: ['v0.*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  client:
+    runs-on: ubuntu-24.04
+    container: espressif/idf:v5.5.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check release version
+        shell: bash
+        run: |
+          version=$(cat VERSION)
+          [[ "$version" =~ ^0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev)?$ ]]
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$version" != *-dev && "$GITHUB_REF_NAME" == "v$version" ]]
+          fi
+      - name: Host sanitizer suites
+        shell: bash
+        run: tests/run-host-tests
+      - name: Build minimal S3 example
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh" >/dev/null
+          tests/build-minimal

@@ -1,191 +1,30 @@
-# MicroLink Testing Guide
+# Validation
 
-This guide covers hardware setup, building, flashing, and testing MicroLink examples.
+## Host regression tests
 
-## Prerequisites
+Use a host C compiler with AddressSanitizer and UndefinedBehaviorSanitizer. The filter and registration suites compile cJSON from the ESP-IDF checkout used by the firmware.
 
-- **ESP-IDF v5.3+** installed ([setup guide](https://docs.espressif.com/projects/esp-idf/en/v5.3/esp32s3/get-started/))
-- **Tailscale account** with an auth key from [admin.tailscale.com](https://login.tailscale.com/admin/settings/keys)
-  - Generate a **reusable + ephemeral** key for development
-- **USB-C cable** for flashing
-
-## Hardware Options
-
-### Option A: XIAO ESP32S3 + Waveshare SIM7600X (Separate Boards)
-
-| Connection | Pin |
-|---|---|
-| ESP32 TX → Modem RXD | GPIO43 (XIAO D6) |
-| ESP32 RX ← Modem TXD | GPIO44 (XIAO D7) |
-| GND | Connected |
-| Power | Separate USB-C for each board |
-
-### Option B: LILYGO T-SIM7670G-S3 (All-in-One)
-
-| Connection | Pin |
-|---|---|
-| ESP32 TX → Modem RXD | GPIO4 |
-| ESP32 RX ← Modem TXD | GPIO5 |
-| PWRKEY | GPIO46 |
-| DTR | GPIO7 |
-| Power | Single USB-C |
-
-Use the `lilygo_sim7670g` example — pin configuration is preset in sdkconfig.defaults.
-
-## Setup Credentials
-
-**All credentials are configured via `idf.py menuconfig`, not in source code.**
-
-1. Copy the credential template:
-   ```bash
-   cd examples/<example_name>
-   cp sdkconfig.credentials.example sdkconfig.credentials
-   ```
-
-2. Edit `sdkconfig.credentials` with your values:
-   ```
-   CONFIG_ML_WIFI_SSID="YourWiFi"
-   CONFIG_ML_WIFI_PASSWORD="YourPassword"
-   CONFIG_ML_TAILSCALE_AUTH_KEY="tskey-auth-..."
-   CONFIG_ML_CELLULAR_SIM_PIN="0000"
-   CONFIG_ML_CELLULAR_APN="your-apn"
-   ```
-
-3. Or set interactively: `idf.py menuconfig` → MicroLink V2 → Credentials
-
-## Build & Flash
-
-```bash
-# Source ESP-IDF
-source ~/esp/esp-idf/export.sh
-
-# Build
-cd examples/<example_name>
-idf.py build
-
-# Flash + monitor
-idf.py -p /dev/ttyACM0 flash monitor
+```sh
+export IDF_PATH=/path/to/esp-idf
+tests/run-host-tests
 ```
 
-## Test 1: WiFi Only (basic_connect)
+The suites exercise receive filtering, coordinator URL parsing, node-key storage, registration framing, network-switch ownership, and AT socket address validation. Platform stubs cover selected failure paths; they do not model RTOS scheduling or modem behavior.
 
-Tests WiFi → Tailscale VPN → bidirectional UDP.
+## Firmware build
 
-```bash
-cd examples/basic_connect
-idf.py build && idf.py -p /dev/ttyACM0 flash monitor
-```
+Load the ESP-IDF 5.5.2 environment and build `examples/minimal` as described in the README. The example defaults target the tested S3 board. Build checks do not require real credentials or a connected device. `tests/build-minimal` uses `sdkconfig.ci` placeholders in a separate build directory so the compiler retains the complete networking path. That firmware is for build validation only and must not be flashed. Configure real credentials only in the ignored `sdkconfig` before a hardware run.
 
-**Verify on your PC (same Tailscale network):**
-```bash
-# Check ESP32 appears on tailnet
-tailscale status | grep esp32
+The older examples remain available for reference. They have board-specific defaults and optional application services. They are not the validated entry point for this fork.
 
-# Ping the ESP32's VPN IP
-tailscale ping <ESP32_VPN_IP>
+## Hardware evidence
 
-# ICMP ping
-ping <ESP32_VPN_IP>
+The client patches were tested in a separate native harness on a LILYGO T3S3 LoRa SX1262 E-Paper board with 4 MB flash and 2 MB Quad PSRAM, using ESP-IDF 5.5.2. The harness tested direct and relay downloads, invalid relay certificates, selected TLS ownership interleavings, repeated shutdown, destination relay replacement, persisted key replacement with manual approval, and direct receive-policy deny/allow/revoke behavior.
 
-# UDP echo test
-echo "ping" | nc -u <ESP32_VPN_IP> 9000
-# Expected: receives "pong"
-```
+A 256 KiB download matched its expected SHA-256 over direct and relayed paths. A separate test compiled Crosspoint's OPDS parser, parsed a catalog, and acquired its 1,569-byte EPUB through London and Frankfurt relays with direct transport blocked. The EPUB hash matched. Full reader UI, SD storage, and rendering were not exercised.
 
-**Expected serial output:**
-```
-WiFi connected, IP: 192.168.x.x
-VPN connected: 100.x.x.x
-UDP socket ready: 100.x.x.x:9000
-```
+ESPHome builds of the patched source passed for S3 Quad PSRAM and C3. A cellular/PPP/network-switch build also passed. These are prior compile results for the extracted source, not runtime validation of those configurations or the new minimal example.
 
-## Test 2: Cellular Only (cellular_connect)
+Before a release, repeat affected tests against the exact release candidate. Evidence from the earlier harness does not automatically cover later code changes. [Known gaps](docs/limitations.md).
 
-Tests 4G cellular modem → PPP data connection → Tailscale VPN → bidirectional UDP.
-Supports PPP (preferred) with automatic fallback to AT socket bridge if PPP fails.
-
-```bash
-cd examples/cellular_connect
-idf.py build && idf.py -p /dev/ttyACM0 flash monitor
-```
-
-**Verify bidirectional UDP:**
-```bash
-# Check ESP32 appears on tailnet
-tailscale status | grep esp32
-
-# DISCO layer test
-tailscale ping <ESP32_VPN_IP>
-
-# ICMP through WireGuard tunnel
-ping -c 5 <ESP32_VPN_IP>
-
-# Bidirectional UDP — send a message and listen for responses
-nc -u <ESP32_VPN_IP> 9000
-# Type: ping, stats, echo:<message>
-```
-
-**Expected serial output:**
-```
-SIM ready, IMEI: XXXXXXXXXXX
-Registered on network: <carrier>
-PPP connected — using lwIP standard sockets
-DERP connect: derp9e.tailscale.com
-VPN connected: 100.x.x.x
-```
-
-**Performance characteristics:**
-
-| Transport | UDP RTT | ICMP RTT | Boot → Connected |
-|-----------|---------|----------|------------------|
-| PPP (direct UDP) | 300-600ms | 400-700ms | ~35-50s |
-| AT socket bridge (DERP relay) | 3-15s | 5-15s | ~60-90s |
-
-## Test 3: WiFi/Cellular Failover (failover_connect)
-
-Tests automatic switching between WiFi and cellular.
-
-```bash
-cd examples/failover_connect
-idf.py build && idf.py -p /dev/ttyACM0 flash monitor
-```
-
-**Failover test procedure:**
-1. Start with WiFi available → connects via WiFi
-2. Turn off WiFi router → after ~90s, switches to cellular
-3. Turn WiFi back on → after ~120s, fails back to WiFi
-
-**Expected serial output during failover:**
-```
-=== CONNECTED via WiFi ===
-[WiFi] state=WIFI_VPN_UP tx=5 rx=3
-Health check failed (1/3)
-Health check failed (2/3)
-Health check failed (3/3)
-=== SWITCHING: WiFi -> Cellular ===
-Starting cellular modem...
-Cellular modem connected
-=== CONNECTED via Cellular ===
-[Cell] state=CELL_VPN_UP tx=12 rx=8
-Failback check: attempting WiFi reconnection...
-=== SWITCHING: Cellular -> WiFi ===
-=== CONNECTED via WiFi ===
-```
-
-## Troubleshooting
-
-### WiFi Issues
-- **"WiFi connection failed"**: Check SSID/password in menuconfig
-- **"VPN connection timeout"**: Check Tailscale auth key is valid and not expired
-
-### Cellular Issues
-- **"AT communication failed"**: Check UART wiring (TX↔RX crossed correctly)
-- **"SIM PIN rejected"**: Verify PIN code
-- **"Network registration timeout"**: Ensure SIM has active data plan, check antenna
-- **"DERP connect failed"**: Modem has IP but DNS/TLS failing — check APN settings
-- **"PPP CHAP authentication failed"**: Check APN/username/password for your carrier
-
-### General
-- **Build error "ML_CELLULAR_PWRKEY_PIN undeclared"**: Run `idf.py fullclean` then `idf.py build`
-- **Flash fails**: Hold BOOT button on XIAO while pressing reset, then flash
-- **No serial output**: Check USB-C cable is data-capable (not charge-only)
+The standalone extraction passes all six host sanitizer suites and links the minimal S3 example with the client, coordinator, DERP, and WireGuard manager present in the ELF. The build-only image is approximately 0.99 MB with ESP-IDF 5.5.2. Existing unused-variable/function warnings remain in inherited code. GitHub Actions runs the same host suites and example build; the hosted job has not run before publication.

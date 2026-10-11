@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo_dir/examples/minimal"
+idf.py -B build/ci -D "SDKCONFIG=$PWD/build/ci/sdkconfig" \
+    -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.ci' build

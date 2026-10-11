@@ -1,0 +1,4 @@
+# Build-only placeholders keep the networking path linked. Never flash this configuration.
+CONFIG_ML_WIFI_SSID="microlink-build-only"
+CONFIG_ML_WIFI_PASSWORD="not-a-real-password"
+CONFIG_ML_TAILSCALE_AUTH_KEY="not-a-real-enrollment-key"

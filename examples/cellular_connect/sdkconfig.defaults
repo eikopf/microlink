@@ -1,4 +1,4 @@
-# MicroLink v2 Cellular Connect — ESP32-S3
+# MicroLink Cellular Connect — ESP32-S3
 # Board selection: change via menuconfig (Waveshare SIM7600X or LILYGO T-SIM7670G-S3)
 # Target
 CONFIG_IDF_TARGET="esp32s3"

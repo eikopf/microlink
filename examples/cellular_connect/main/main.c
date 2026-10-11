@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief MicroLink v2 Cellular Connect Example
+ * @brief MicroLink Cellular Connect Example
  *
  * Connects to Tailscale over 4G cellular using SIM7600 module.
  * No WiFi required — all traffic goes through the AT socket bridge,
@@ -199,7 +199,7 @@ void app_main(void) {
 
     printf("\n");
     printf("================================================================\n");
-    printf("  MicroLink v2 — Cellular Connect (SIM7600 4G)\n");
+    printf("  MicroLink — Cellular Connect (SIM7600 4G)\n");
     printf("  PPP primary, AT socket bridge fallback\n");
 #ifdef CONFIG_ML_EXAMPLE_TCP
     printf("  Transport: TCP (port %d)\n", CONFIG_ML_EXAMPLE_TCP_PORT);

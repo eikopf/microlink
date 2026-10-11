@@ -1,6 +1,6 @@
 /**
  * @file microlink.c
- * @brief MicroLink v2 - Public API and Task Orchestration
+ * @brief MicroLink - Public API and Task Orchestration
  *
  * Creates all FreeRTOS tasks, queues, and event groups.
  * Provides the public API that the application calls.
@@ -388,7 +388,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         return NULL;
     }
 
-    ESP_LOGI(TAG, "MicroLink v2 initialized (max_peers=%d)", ml->config.max_peers);
+    ESP_LOGI(TAG, "MicroLink " MICROLINK_VERSION " initialized (max_peers=%d)", ml->config.max_peers);
     return ml;
 }
 

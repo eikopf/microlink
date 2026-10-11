@@ -34,3 +34,7 @@ docs/PPP_ANALYSIS.md
 # OS
 .DS_Store
 Thumbs.db
+
+# Local validation output
+/artifacts/
+__pycache__/
