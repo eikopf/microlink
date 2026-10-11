@@ -38,3 +38,7 @@ Thumbs.db
 # Local validation output
 /artifacts/
 __pycache__/
+
+/result
+/result-*
+/.direnv/
