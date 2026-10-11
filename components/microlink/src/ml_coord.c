@@ -181,17 +181,6 @@ static void bytes_to_hex(const uint8_t *bytes, size_t len, char *hex) {
     hex[len * 2] = '\0';
 }
 
-static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t max_len) {
-    size_t hex_len = strlen(hex);
-    if (hex_len % 2 != 0 || hex_len / 2 > max_len) return -1;
-    for (size_t i = 0; i < hex_len / 2; i++) {
-        unsigned int val;
-        if (sscanf(hex + i * 2, "%2x", &val) != 1) return -1;
-        bytes[i] = (uint8_t)val;
-    }
-    return hex_len / 2;
-}
-
 /* ============================================================================
  * Control-plane URL parsing + Noise server key fetch (Headscale / custom)
  *
@@ -210,15 +199,22 @@ static int hex_nybble(char c) {
     return -1;
 }
 
-/* Hex-decode exactly 64 chars into 32 bytes. Returns 0 on success. */
-static int hex_to_bytes32(const char *hex, uint8_t out[32]) {
-    for (int i = 0; i < 32; i++) {
+/* Decode exactly one key. Failed input leaves the destination unchanged. */
+static int hex_to_bytes(const char *hex, uint8_t *bytes, size_t length) {
+    if (!hex || !bytes || length != 32 || strlen(hex) != 64) return -1;
+    uint8_t decoded[32];
+    for (size_t i = 0; i < 32; ++i) {
         int hi = hex_nybble(hex[i * 2]);
         int lo = hex_nybble(hex[i * 2 + 1]);
         if (hi < 0 || lo < 0) return -1;
-        out[i] = (uint8_t)((hi << 4) | lo);
+        decoded[i] = (uint8_t)((hi << 4) | lo);
     }
-    return 0;
+    memcpy(bytes, decoded, sizeof(decoded));
+    return 32;
+}
+
+static int hex_to_bytes32(const char *hex, uint8_t out[32]) {
+    return hex_to_bytes(hex, out, 32) == 32 ? 0 : -1;
 }
 
 /* Parse the /key?v=<ML_CTRL_PROTOCOL_VER> HTTP response (already NUL-terminated).
@@ -1125,8 +1121,7 @@ static void process_proactive_frames(microlink_t *ml, ml_noise_state_t *noise) {
                     /* Parse "chalpub:hex..." format (v1 lines 1402-1424) */
                     if (strncmp(chal_str, "chalpub:", 8) == 0) {
                         const char *hex = chal_str + 8;
-                        if (strlen(hex) >= 64) {
-                            hex_to_bytes(hex, s_node_key_challenge, 32);
+                        if (hex_to_bytes(hex, s_node_key_challenge, 32) == 32) {
                             s_has_node_key_challenge = true;
                             ESP_LOGI(TAG, "NodeKeyChallenge decoded (32 bytes)");
                         }
@@ -1731,10 +1726,11 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
 
         /* NodeKey: "nodekey:HEX..." */
         cJSON *key = cJSON_GetObjectItem(peer, "Key");
-        if (key && key->valuestring) {
-            const char *hex = key->valuestring;
-            if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-            hex_to_bytes(hex, update->public_key, 32);
+        const char *node_hex = key ? key->valuestring : NULL;
+        if (node_hex && strncmp(node_hex, "nodekey:", 8) == 0) node_hex += 8;
+        if (hex_to_bytes(node_hex, update->public_key, 32) != 32) {
+            free(update);
+            continue;
         }
 
         /* DiscoKey: "discokey:HEX..." */
@@ -1742,7 +1738,10 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
         if (disco && disco->valuestring) {
             const char *hex = disco->valuestring;
             if (strncmp(hex, "discokey:", 9) == 0) hex += 9;
-            hex_to_bytes(hex, update->disco_key, 32);
+            if (hex_to_bytes(hex, update->disco_key, 32) != 32) {
+                free(update);
+                continue;
+            }
         }
 
         /* VPN IP from Addresses */
@@ -1867,7 +1866,7 @@ static void parse_peers_from_map_response(microlink_t *ml, cJSON *root) {
                 const char *hex = k->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
                 uint8_t key[32];
-                hex_to_bytes(hex, key, 32);
+                if (hex_to_bytes(hex, key, 32) != 32) continue;
                 if (memcmp(key, ml->peers[i].public_key, 32) == 0) {
                     present = true;
                     break;
@@ -1920,7 +1919,10 @@ check_removed:
             } else {
                 const char *hex = key_item->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                hex_to_bytes(hex, update->public_key, 32);
+                if (hex_to_bytes(hex, update->public_key, 32) != 32) {
+                    free(update);
+                    continue;
+                }
                 ESP_LOGI(TAG, "  Remove peer: %02x%02x%02x%02x...",
                          update->public_key[0], update->public_key[1],
                          update->public_key[2], update->public_key[3]);
@@ -1960,7 +1962,10 @@ check_removed:
             if (key_item && key_item->valuestring) {
                 const char *hex = key_item->valuestring;
                 if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                hex_to_bytes(hex, update->public_key, 32);
+                if (hex_to_bytes(hex, update->public_key, 32) != 32) {
+                    free(update);
+                    continue;
+                }
             }
 
             /* DERP region. */
@@ -2345,15 +2350,20 @@ static void map_sliced_peers(microlink_t *ml) {
         }
         if (authoritative) {
             cJSON *k = cJSON_GetObjectItem(peer, "Key");
-            uint8_t *grown = (k && k->valuestring) ? realloc(keys, (size_t)(key_count + 1) * 32) : NULL;
-            if (grown) {
-                const char *hex = k->valuestring;
-                if (strncmp(hex, "nodekey:", 8) == 0) hex += 8;
-                keys = grown;
-                hex_to_bytes(hex, keys + (size_t)key_count * 32, 32);
-                key_count++;
-            } else if (k && k->valuestring) {
+            const char *hex = k ? k->valuestring : NULL;
+            uint8_t decoded[32];
+            if (hex && strncmp(hex, "nodekey:", 8) == 0) hex += 8;
+            if (hex_to_bytes(hex, decoded, 32) != 32) {
                 keys_complete = false;
+            } else {
+                uint8_t *grown = realloc(keys, (size_t)(key_count + 1) * 32);
+                if (grown) {
+                    keys = grown;
+                    memcpy(keys + (size_t)key_count * 32, decoded, 32);
+                    key_count++;
+                } else {
+                    keys_complete = false;
+                }
             }
         }
         cJSON *chunk = cJSON_CreateObject();

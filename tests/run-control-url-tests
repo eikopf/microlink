@@ -10,3 +10,14 @@ trap 'rm -rf "$test_dir"' EXIT
     "$repo_dir/components/microlink/src/ml_control_url.c" \
     -o "$test_dir/control-url-test"
 "$test_dir/control-url-test"
+python3 - "$repo_dir/components/microlink/src/ml_coord.c" "$test_dir/key_parse_functions.inc" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+start = source.index("static int hex_nybble(")
+end = source.index("/* Parse the /key", start)
+pathlib.Path(sys.argv[2]).write_text(source[start:end])
+PY
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g \
+    -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I "$test_dir" "$repo_dir/tests/key_parse_test.c" -o "$test_dir/key-parse-test"
+"$test_dir/key-parse-test"
