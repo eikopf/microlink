@@ -37,6 +37,11 @@ static const char *TAG = "ml_net_sw";
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
 #define NET_SW_STACK_SIZE   6144
+#define HEALTH_CHECK_BIT   BIT2
+#define FAILBACK_CHECK_BIT BIT3
+#define TASK_EXITED_BIT    BIT4
+#define STOP_REQUEST_BIT   BIT5
+#define TIMERS_DRAINED_BIT BIT6
 
 typedef struct {
     /* Config (copied) */
@@ -65,12 +70,17 @@ typedef struct {
     ml_net_type_t active_transport;
     microlink_t *ml;
     bool initialized;
+    bool deinitializing;
+    bool timer_drain_queued;
     bool running;
 
     /* WiFi */
     esp_netif_t *wifi_netif;
     EventGroupHandle_t wifi_events;
     int wifi_retry_count;
+    bool wifi_active;
+    esp_event_handler_instance_t wifi_handler;
+    esp_event_handler_instance_t ip_handler;
 
     /* Health monitoring */
     TimerHandle_t health_timer;
@@ -85,6 +95,14 @@ typedef struct {
 
 static ml_net_switch_ctx_t s_ctx = {0};
 
+static bool net_running(void) {
+    return __atomic_load_n(&s_ctx.running, __ATOMIC_ACQUIRE);
+}
+
+static void set_running(bool running) {
+    __atomic_store_n(&s_ctx.running, running, __ATOMIC_RELEASE);
+}
+
 /* ============================================================================
  * WiFi Management
  * ========================================================================== */
@@ -92,6 +110,7 @@ static ml_net_switch_ctx_t s_ctx = {0};
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                 int32_t event_id, void *event_data)
 {
+    if (!net_running() || !__atomic_load_n(&s_ctx.wifi_active, __ATOMIC_ACQUIRE)) return;
     if (event_base == WIFI_EVENT) {
         if (event_id == WIFI_EVENT_STA_START) {
             esp_wifi_connect();
@@ -124,9 +143,9 @@ static esp_err_t wifi_start(void)
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         ESP_ERROR_CHECK(esp_wifi_init(&cfg));
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
-            WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
+            WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &s_ctx.wifi_handler));
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
-            IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+            IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &s_ctx.ip_handler));
     }
 
     wifi_config_t wifi_config = {0};
@@ -136,15 +155,17 @@ static esp_err_t wifi_start(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    __atomic_store_n(&s_ctx.wifi_active, true, __ATOMIC_RELEASE);
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
     /* Wait for connection */
     EventBits_t bits = xEventGroupWaitBits(s_ctx.wifi_events,
-                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | STOP_REQUEST_BIT,
                                             pdFALSE, pdFALSE,
                                             pdMS_TO_TICKS(s_ctx.wifi_timeout_ms));
 
+    if (!net_running()) return ESP_ERR_INVALID_STATE;
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "WiFi connected");
         return ESP_OK;
@@ -156,6 +177,7 @@ static esp_err_t wifi_start(void)
 
 static void wifi_stop(void)
 {
+    __atomic_store_n(&s_ctx.wifi_active, false, __ATOMIC_RELEASE);
     ESP_LOGI(TAG, "Stopping WiFi...");
     esp_wifi_disconnect();
     esp_wifi_stop();
@@ -226,8 +248,11 @@ static void cellular_stop(void)
  * MicroLink VPN Management
  * ========================================================================== */
 
+static esp_err_t vpn_stop(void);
+
 static esp_err_t vpn_start(void)
 {
+    if (s_ctx.ml || !net_running()) return ESP_ERR_INVALID_STATE;
     const char *name = s_ctx.device_name[0] ? s_ctx.device_name : NULL;
 
     /* For cellular, prefer IMEI-based name */
@@ -256,9 +281,8 @@ static esp_err_t vpn_start(void)
     esp_err_t err = microlink_start(s_ctx.ml);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "microlink_start failed: %s", esp_err_to_name(err));
-        microlink_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
-        return err;
+        esp_err_t cleanup = vpn_stop();
+        return cleanup == ESP_OK ? err : cleanup;
     }
 
     /* Wait for connection — large tailnets (200+ peers) over cellular can take
@@ -266,7 +290,7 @@ static esp_err_t vpn_start(void)
      * Use 180s for cellular, 60s for WiFi. */
     int timeout_ticks = (s_ctx.active_transport == ML_NET_WIFI) ? 120 : 360;
     int timeout_secs = timeout_ticks / 2;
-    for (int i = 0; i < timeout_ticks; i++) {
+    for (int i = 0; i < timeout_ticks && net_running(); i++) {
         if (microlink_is_connected(s_ctx.ml)) {
             uint32_t ip = microlink_get_vpn_ip(s_ctx.ml);
             char ip_str[16];
@@ -280,19 +304,22 @@ static esp_err_t vpn_start(void)
     }
 
     ESP_LOGW(TAG, "VPN connection timeout (%ds)", timeout_secs);
-    microlink_stop(s_ctx.ml);
-    microlink_destroy(s_ctx.ml);
-    s_ctx.ml = NULL;
-    return ESP_ERR_TIMEOUT;
+    esp_err_t cleanup = vpn_stop();
+    return cleanup == ESP_OK ? ESP_ERR_TIMEOUT : cleanup;
 }
 
-static void vpn_stop(void)
+static esp_err_t vpn_stop(void)
 {
-    if (s_ctx.ml) {
-        microlink_stop(s_ctx.ml);
-        microlink_destroy(s_ctx.ml);
-        s_ctx.ml = NULL;
+    if (!s_ctx.ml) return ESP_OK;
+    esp_err_t err = microlink_stop(s_ctx.ml);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "VPN cleanup incomplete; instance and transport retained: %s", esp_err_to_name(err));
+        s_ctx.state = ML_NET_SW_ERROR;
+        return err;
     }
+    microlink_destroy(s_ctx.ml);
+    s_ctx.ml = NULL;
+    return ESP_OK;
 }
 
 /* ============================================================================
@@ -301,7 +328,12 @@ static void vpn_stop(void)
 
 static void health_timer_cb(TimerHandle_t timer)
 {
-    if (!s_ctx.running || !s_ctx.ml) return;
+    xEventGroupSetBits(s_ctx.wifi_events, HEALTH_CHECK_BIT);
+}
+
+static void check_health(void)
+{
+    if (!s_ctx.ml) return;
 
     if (!microlink_is_connected(s_ctx.ml)) {
         s_ctx.health_fail_counter++;
@@ -319,10 +351,6 @@ static void health_timer_cb(TimerHandle_t timer)
                 s_ctx.state = ML_NET_SW_SWITCHING_TO_WIFI;
             }
 
-            /* Wake the task */
-            if (s_ctx.task_handle) {
-                xTaskNotifyGive(s_ctx.task_handle);
-            }
         }
     } else {
         s_ctx.health_fail_counter = 0;
@@ -335,15 +363,7 @@ static void health_timer_cb(TimerHandle_t timer)
 
 static void failback_timer_cb(TimerHandle_t timer)
 {
-    if (!s_ctx.running) return;
-    if (s_ctx.active_transport != ML_NET_CELLULAR) return;
-
-    ESP_LOGI(TAG, "Failback check: attempting WiFi reconnection...");
-    s_ctx.state = ML_NET_SW_SWITCHING_TO_WIFI;
-
-    if (s_ctx.task_handle) {
-        xTaskNotifyGive(s_ctx.task_handle);
-    }
+    xEventGroupSetBits(s_ctx.wifi_events, FAILBACK_CHECK_BIT);
 }
 
 /* ============================================================================
@@ -359,6 +379,7 @@ static void net_switch_task(void *arg)
     s_ctx.active_transport = ML_NET_WIFI;
 
     esp_err_t err = wifi_start();
+    if (!net_running()) goto task_exit;
     if (err == ESP_OK) {
         /* WiFi connected, start VPN */
         err = vpn_start();
@@ -373,12 +394,16 @@ static void net_switch_task(void *arg)
         }
     }
 
+    if (s_ctx.ml) goto cleanup_failed;
+    if (!net_running()) goto task_exit;
+
     /* WiFi failed — try cellular */
     ESP_LOGW(TAG, "WiFi path failed, falling back to cellular");
     wifi_stop();
     goto try_cellular;
 
 try_cellular:
+    if (!net_running()) goto task_exit;
     s_ctx.state = ML_NET_SW_CELL_CONNECTING;
     s_ctx.active_transport = ML_NET_CELLULAR;
 
@@ -387,6 +412,7 @@ try_cellular:
     }
 
     err = cellular_start();
+    if (!net_running()) goto task_exit;
     if (err == ESP_OK) {
         err = vpn_start();
         if (err == ESP_OK) {
@@ -403,6 +429,9 @@ try_cellular:
         }
     }
 
+    if (s_ctx.ml) goto cleanup_failed;
+    if (!net_running()) goto task_exit;
+
     /* Both failed */
     ESP_LOGE(TAG, "Both WiFi and cellular failed!");
     s_ctx.state = ML_NET_SW_ERROR;
@@ -411,8 +440,8 @@ try_cellular:
     }
 
     /* Retry after 30s */
-    vTaskDelay(pdMS_TO_TICKS(30000));
-    if (s_ctx.running) {
+    xEventGroupWaitBits(s_ctx.wifi_events, STOP_REQUEST_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
+    if (net_running()) {
         cellular_stop();
         s_ctx.state = ML_NET_SW_WIFI_CONNECTING;
         s_ctx.active_transport = ML_NET_WIFI;
@@ -420,11 +449,14 @@ try_cellular:
     }
 
 state_loop:
-    while (s_ctx.running) {
-        /* Wait for notification from health/failback timer */
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
-
-        if (!s_ctx.running) break;
+    while (net_running()) {
+        EventBits_t pending = xEventGroupWaitBits(s_ctx.wifi_events,
+            HEALTH_CHECK_BIT | FAILBACK_CHECK_BIT | STOP_REQUEST_BIT,
+            pdTRUE, pdFALSE, pdMS_TO_TICKS(5000));
+        if (!net_running()) break;
+        if (pending & HEALTH_CHECK_BIT) check_health();
+        if ((pending & FAILBACK_CHECK_BIT) && s_ctx.active_transport == ML_NET_CELLULAR)
+            s_ctx.state = ML_NET_SW_SWITCHING_TO_WIFI;
 
         switch (s_ctx.state) {
             case ML_NET_SW_SWITCHING_TO_CELL: {
@@ -436,7 +468,7 @@ state_loop:
                 }
 
                 /* Tear down WiFi VPN */
-                vpn_stop();
+                if (vpn_stop() != ESP_OK) goto cleanup_failed;
                 wifi_stop();
 
                 goto try_cellular;
@@ -454,6 +486,7 @@ state_loop:
 
                 /* Temporarily try WiFi — if it fails, stay on cellular */
                 esp_err_t wifi_err = wifi_start();
+                if (!net_running()) goto task_exit;
                 if (wifi_err == ESP_OK) {
                     /* WiFi is back! Tear down cellular and switch */
                     ESP_LOGI(TAG, "WiFi recovered! Switching back from cellular");
@@ -462,7 +495,7 @@ state_loop:
                         s_ctx.on_switching(ML_NET_CELLULAR, ML_NET_WIFI, s_ctx.user_data);
                     }
 
-                    vpn_stop();
+                    if (vpn_stop() != ESP_OK) goto cleanup_failed;
                     cellular_stop();
 
                     s_ctx.active_transport = ML_NET_WIFI;
@@ -474,6 +507,8 @@ state_loop:
                         }
                         xTimerStart(s_ctx.health_timer, 0);
                     } else {
+                        if (s_ctx.ml) goto cleanup_failed;
+                        if (!net_running()) goto task_exit;
                         /* WiFi VPN failed, go back to cellular */
                         ESP_LOGW(TAG, "WiFi VPN failed, reverting to cellular");
                         wifi_stop();
@@ -497,8 +532,14 @@ state_loop:
         }
     }
 
+    goto task_exit;
+
+cleanup_failed:
+    s_ctx.state = ML_NET_SW_ERROR;
+    set_running(false);
+task_exit:
     ESP_LOGI(TAG, "Network switch task exiting");
-    s_ctx.task_handle = NULL;
+    xEventGroupSetBits(s_ctx.wifi_events, TASK_EXITED_BIT);
     vTaskDelete(NULL);
 }
 
@@ -561,17 +602,49 @@ esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config)
     return ESP_OK;
 }
 
+static void timers_drained(void *arg, uint32_t unused)
+{
+    xEventGroupSetBits((EventGroupHandle_t)arg, TIMERS_DRAINED_BIT);
+}
+
 void ml_net_switch_deinit(void)
 {
     if (!s_ctx.initialized) return;
 
-    ml_net_switch_stop();
+    if (ml_net_switch_stop() != ESP_OK) {
+        ESP_LOGE(TAG, "Deinit deferred until shutdown completes");
+        return;
+    }
+    s_ctx.deinitializing = true;
 
     if (s_ctx.health_timer) {
-        xTimerDelete(s_ctx.health_timer, portMAX_DELAY);
+        if (xTimerDelete(s_ctx.health_timer, portMAX_DELAY) != pdPASS) return;
+        s_ctx.health_timer = NULL;
     }
     if (s_ctx.failback_timer) {
-        xTimerDelete(s_ctx.failback_timer, portMAX_DELAY);
+        if (xTimerDelete(s_ctx.failback_timer, portMAX_DELAY) != pdPASS) return;
+        s_ctx.failback_timer = NULL;
+    }
+    /* Timer deletion is queued; wait behind both commands before freeing events. */
+    if (!s_ctx.timer_drain_queued) {
+        xEventGroupClearBits(s_ctx.wifi_events, TIMERS_DRAINED_BIT);
+        if (xTimerPendFunctionCall(timers_drained, s_ctx.wifi_events, 0, portMAX_DELAY) != pdPASS) return;
+        s_ctx.timer_drain_queued = true;
+    }
+    if (!(xEventGroupWaitBits(s_ctx.wifi_events, TIMERS_DRAINED_BIT,
+                              pdFALSE, pdTRUE, pdMS_TO_TICKS(15000)) & TIMERS_DRAINED_BIT)) return;
+    if (s_ctx.wifi_handler) {
+        if (esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_ctx.wifi_handler) != ESP_OK) return;
+        s_ctx.wifi_handler = NULL;
+    }
+    if (s_ctx.ip_handler) {
+        if (esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, s_ctx.ip_handler) != ESP_OK) return;
+        s_ctx.ip_handler = NULL;
+    }
+    if (s_ctx.wifi_netif) {
+        if (esp_wifi_deinit() != ESP_OK) return;
+        esp_netif_destroy_default_wifi(s_ctx.wifi_netif);
+        s_ctx.wifi_netif = NULL;
     }
     if (s_ctx.wifi_events) {
         vEventGroupDelete(s_ctx.wifi_events);
@@ -582,15 +655,16 @@ void ml_net_switch_deinit(void)
 
 esp_err_t ml_net_switch_start(void)
 {
-    if (!s_ctx.initialized) return ESP_ERR_INVALID_STATE;
-    if (s_ctx.running) return ESP_ERR_INVALID_STATE;
+    if (!s_ctx.initialized || s_ctx.deinitializing) return ESP_ERR_INVALID_STATE;
+    if (net_running() || s_ctx.task_handle || s_ctx.ml) return ESP_ERR_INVALID_STATE;
 
-    s_ctx.running = true;
+    xEventGroupClearBits(s_ctx.wifi_events, TASK_EXITED_BIT | STOP_REQUEST_BIT | HEALTH_CHECK_BIT | FAILBACK_CHECK_BIT);
+    set_running(true);
 
     BaseType_t ret = xTaskCreate(net_switch_task, "net_sw",
                                   NET_SW_STACK_SIZE, NULL, 5, &s_ctx.task_handle);
     if (ret != pdPASS) {
-        s_ctx.running = false;
+        set_running(false);
         return ESP_ERR_NO_MEM;
     }
 
@@ -599,30 +673,24 @@ esp_err_t ml_net_switch_start(void)
 
 esp_err_t ml_net_switch_stop(void)
 {
-    if (!s_ctx.running) return ESP_OK;
-
-    s_ctx.running = false;
-
-    /* Stop timers */
+    if (!s_ctx.initialized) return ESP_OK;
+    if (s_ctx.task_handle && xTaskGetCurrentTaskHandle() == s_ctx.task_handle)
+        return ESP_ERR_INVALID_STATE;
+    set_running(false);
     if (s_ctx.health_timer) xTimerStop(s_ctx.health_timer, portMAX_DELAY);
     if (s_ctx.failback_timer) xTimerStop(s_ctx.failback_timer, portMAX_DELAY);
+    xEventGroupSetBits(s_ctx.wifi_events, STOP_REQUEST_BIT);
 
-    /* Wake task so it exits */
     if (s_ctx.task_handle) {
-        xTaskNotifyGive(s_ctx.task_handle);
-        /* Wait for task to exit */
-        vTaskDelay(pdMS_TO_TICKS(500));
+        EventBits_t bits = xEventGroupWaitBits(s_ctx.wifi_events, TASK_EXITED_BIT,
+                                              pdFALSE, pdTRUE, pdMS_TO_TICKS(15000));
+        if (!(bits & TASK_EXITED_BIT)) return ESP_ERR_TIMEOUT;
+        s_ctx.task_handle = NULL;
     }
-
-    /* Tear down connections */
-    vpn_stop();
-
-    if (s_ctx.active_transport == ML_NET_WIFI) {
-        wifi_stop();
-    } else {
-        cellular_stop();
-    }
-
+    esp_err_t err = vpn_stop();
+    if (err != ESP_OK) return err;
+    wifi_stop();
+    cellular_stop();
     s_ctx.state = ML_NET_SW_IDLE;
     return ESP_OK;
 }

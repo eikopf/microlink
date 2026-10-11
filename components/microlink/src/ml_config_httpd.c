@@ -755,7 +755,7 @@ static esp_err_t handler_monitor(httpd_req_t *req) {
         }
 
         /* DERP status */
-        cJSON_AddBoolToObject(json, "derp_connected", ml->derp.connected);
+        cJSON_AddBoolToObject(json, "derp_connected", ml_derp_connected(&ml->derp));
         cJSON_AddNumberToObject(json, "derp_home_region", ml->derp_home_region);
     }
 

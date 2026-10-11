@@ -59,8 +59,9 @@ typedef struct {
     /* Custom control plane host (NULL or empty = Tailscale SaaS at
      * controlplane.tailscale.com). Set to a Headscale/Ionscale URL for
      * self-hosted coordinators. Accepted forms: "host", "host:port",
-     * "http://host", "http://host:port". https:// is rejected.
-     * Internally clipped to 63 chars (see ml->ctrl_host[64]). */
+     * "https://host", "https://host:port". Bare hosts use HTTPS on port
+     * 443. Plain HTTP is rejected because the Noise key is fetched here.
+     * Maximum 63 characters; invalid or longer values fail initialization. */
     const char *ctrl_host;
 
     /* Routes the node advertises to the tailnet (Tailscale's
@@ -69,9 +70,6 @@ typedef struct {
      * approval on the control plane before traffic actually flows.
      * NULL/empty = no routes advertised. Internally clipped to 255 chars. */
     const char *advertise_routes;
-
-    /* Application-provided PeerAPI DNS HTTP listener; 0 = not provided. */
-    uint16_t peer_api_port;
 
     /* Netcheck override policy.
      *   netcheck_override_enabled = false → always trust the configured
@@ -169,9 +167,11 @@ esp_err_t microlink_start(microlink_t *ml);
 /**
  * @brief Stop and disconnect from Tailscale
  * @param ml Handle
- * @return ESP_OK on success
+ * @return ESP_OK on success, ESP_ERR_TIMEOUT while workers remain alive,
+ *         ESP_ERR_NO_MEM if zero-copy cleanup cannot be scheduled
  *
  * Gracefully shuts down all tasks and closes connections.
+ * On failure, retain the handle and retry stop before starting another session.
  */
 esp_err_t microlink_stop(microlink_t *ml);
 
@@ -197,6 +197,10 @@ void microlink_destroy(microlink_t *ml);
  * @brief Get current connection state
  */
 microlink_state_t microlink_get_state(const microlink_t *ml);
+
+/** An expired node key has a persisted replacement. Stop/destroy this instance,
+ * then initialize a new instance to register it. Machine identity is preserved. */
+bool microlink_node_key_restart_required(const microlink_t *ml);
 
 /**
  * @brief Check if connected and ready to send/receive
@@ -232,18 +236,6 @@ int64_t microlink_get_key_expiry(const microlink_t *ml);
  */
 struct netif;
 esp_err_t microlink_pin_wg_output_netif(microlink_t *ml, struct netif *upstream);
-
-/**
- * @brief Is this IPv4 address a tailnet peer programmed into the WireGuard netif?
- *
- * True when a peer owns the address as a /32 allowed IP. For route hooks that
- * must tell a tailnet node from an unrelated host in 100.64.0.0/10 (an uplink
- * can live in that range too). Read-only; call it from the TCP/IP thread.
- *
- * @param wg_netif The WireGuard lwIP netif (may be NULL -> false)
- * @param ip_nbo   Address, network byte order
- */
-bool microlink_wg_has_peer_ip(struct netif *wg_netif, uint32_t ip_nbo);
 
 /**
  * @brief Get number of known peers
@@ -286,14 +278,6 @@ typedef struct {
      * the Headscale node list without dumping the full key. */
     bool     identity_persistent;
     char     identity_pubkey_prefix[17];
-
-    /* Reconnect-cause counters since boot. Kept separate per detector so a
-     * fleet can tell watchdog saves from ordinary transport flaps (a single
-     * combined count overcounts — esphome-tailscale#32 lesson). */
-    uint32_t rc_coord_stream_wd;  /* control-plane map-stream watchdog fired */
-    uint32_t rc_coord_transport;  /* established coord session died (transport) */
-    uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
-    uint32_t rc_derp_retry;       /* failed DERP connect attempts (backoff ladder) */
 } microlink_diag_t;
 
 esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out);

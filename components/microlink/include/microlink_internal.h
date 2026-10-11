@@ -16,6 +16,7 @@
 #pragma once
 
 #include "microlink.h"
+#include "ml_filter.h"
 #include "ml_config_httpd.h"
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -53,6 +54,16 @@ extern "C" {
  * wg_mgr ~4.3K. Trimmed only the clearly-oversized ones, keeping a generous
  * margin over the observed peak (TLS handshakes can spike). coord/wg_mgr
  * left as-is — they run closer to their ceiling. */
+/* #48: single-core chips (ESP32-C3/C6, ...) have no core 1; pinning a task
+ * there asserts in xTaskCreatePinnedToCore at boot. ML_CORE(n) folds the
+ * second core onto core 0 when the build is unicore, and is the identity on
+ * dual-core chips. */
+#if CONFIG_FREERTOS_UNICORE || (defined(portNUM_PROCESSORS) && portNUM_PROCESSORS == 1)
+#define ML_CORE(n) 0
+#else
+#define ML_CORE(n) (n)
+#endif
+
 #define ML_TASK_NET_IO_STACK    (6 * 1024)   /* was 8K; ~3K peak observed */
 #define ML_TASK_NET_IO_PRIO     7
 #define ML_TASK_NET_IO_CORE     0
@@ -63,11 +74,11 @@ extern "C" {
 
 #define ML_TASK_COORD_STACK     (12 * 1024)
 #define ML_TASK_COORD_PRIO      5
-#define ML_TASK_COORD_CORE      1
+#define ML_TASK_COORD_CORE      ML_CORE(1)
 
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
 #define ML_TASK_WG_MGR_PRIO     7
-#define ML_TASK_WG_MGR_CORE     1
+#define ML_TASK_WG_MGR_CORE     ML_CORE(1)
 
 /* Queue depths */
 /* TX 16->64 (2026-05-27): absorb speedtest bursts so packets queue instead of
@@ -250,6 +261,8 @@ typedef struct {
     uint8_t *data;              /* Heap-allocated payload (caller frees on failure) */
     size_t len;                 /* Payload length */
     uint8_t frame_type;         /* DERP frame type (0x04 = SendPacket) */
+    uint16_t region;            /* Control frames must return on their source connection. */
+    uint32_t generation;        /* Reject control replies queued before reconnect. */
 } ml_derp_tx_item_t;
 
 /* Received packet (from net_io to disco/wg queues) */
@@ -401,6 +414,7 @@ typedef struct {
 
 #define ML_MAX_DERP_REGIONS     32
 #define ML_MAX_DERP_NODES       4
+#define ML_DERP_EXTRA_CONNECTIONS 2
 
 typedef struct {
     char hostname[64];
@@ -445,14 +459,36 @@ typedef struct {
 
 typedef struct {
     int sockfd;                     /* Raw TCP socket */
-    mbedtls_ssl_context ssl;        /* TLS context (owned exclusively by DERP I/O task) */
+    uint16_t region;
+    uint32_t generation;
+    SemaphoreHandle_t io_mutex;     /* Serializes calls on the shared SSL context. */
+    bool tls_failed;                /* Protected by io_mutex after setup. */
+    mbedtls_ssl_context ssl;        /* One reader and one writer; writer owns setup/teardown. */
     mbedtls_ssl_config ssl_conf;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
     bool connected;
-    volatile bool rx_parked;        /* reader sets true when NOT touching the ssl context */
+    bool rx_parked;                 /* Access through atomic helpers below. */
     uint64_t last_recv_ms;          /* For keepalive watchdog */
+    uint64_t last_send_ms;          /* Writer-owned eviction age. */
+    uint64_t next_retry_ms;         /* Writer-owned connection backoff. */
 } ml_derp_conn_t;
+
+static inline bool ml_derp_connected(const ml_derp_conn_t *conn) {
+    return __atomic_load_n(&conn->connected, __ATOMIC_SEQ_CST);
+}
+
+static inline void ml_derp_set_connected(ml_derp_conn_t *conn, bool connected) {
+    __atomic_store_n(&conn->connected, connected, __ATOMIC_SEQ_CST);
+}
+
+static inline bool ml_derp_rx_is_parked(const ml_derp_conn_t *conn) {
+    return __atomic_load_n(&conn->rx_parked, __ATOMIC_SEQ_CST);
+}
+
+static inline void ml_derp_rx_set_parked(ml_derp_conn_t *conn, bool parked) {
+    __atomic_store_n(&conn->rx_parked, parked, __ATOMIC_SEQ_CST);
+}
 
 /* ============================================================================
  * Main Context
@@ -465,6 +501,10 @@ struct microlink_s {
     /* State (atomic reads from any task, writes only from coord) */
     volatile microlink_state_t state;
     volatile uint32_t vpn_ip;
+
+    /* Shared by coordinator, WireGuard receive, and lwIP output. */
+    ml_filter_t *receive_filter;
+    SemaphoreHandle_t filter_mutex;
 
     /* True when load_or_generate_keys() found every keypair in NVS at
      * boot (i.e. this device has a persistent node identity). False
@@ -486,16 +526,6 @@ struct microlink_s {
     int  register_user_id;
     char register_user_name[48];
 
-    /* Reconnect-cause counters (per boot; exported via microlink_diag_t so
-     * telemetry can ship them). A single undifferentiated "connect count"
-     * overcounts as a health signal — ordinary transport drops look the
-     * same as watchdog saves (esphome-tailscale#32 field verification) —
-     * so each detector counts separately. */
-    volatile uint32_t rc_coord_stream_wd;  /* map-stream watchdog fired */
-    volatile uint32_t rc_coord_transport;  /* established coord session died (ctrl watchdog / PING send / recv) */
-    volatile uint32_t rc_derp_rx_wd;       /* DERP RX-liveness watchdog fired */
-    volatile uint32_t rc_derp_retry;       /* failed DERP connect attempts on the backoff ladder */
-
     /* Event group (cross-task synchronization) */
     EventGroupHandle_t events;
 
@@ -511,7 +541,7 @@ struct microlink_s {
      * poll_map_update() when microlink_destroy() freed the instance was a
      * use-after-free PANIC on the reference router (reconnect burst). */
     volatile int tasks_alive;
-    bool stop_incomplete;           /* a task outlived the stop wait: destroy must not free */
+    bool stop_incomplete;           /* workers or network callbacks still own the context */
 
     /* Queues */
     QueueHandle_t derp_tx_queue;        /* -> derp_tx task */
@@ -526,12 +556,22 @@ struct microlink_s {
     uint8_t machine_public_key[32];
     uint8_t wg_private_key[32];         /* WireGuard key */
     uint8_t wg_public_key[32];
+    uint8_t wg_old_public_key[32];     /* predecessor while registration is pending */
+    bool wg_rotation_pending;
+    bool node_key_restart_required;   /* atomic: replacement staged for a fresh instance */
     uint8_t disco_private_key[32];      /* DISCO key */
     uint8_t disco_public_key[32];
 
     /* DERP connection (owned exclusively by DERP I/O task after connect) */
     /* Connection setup by coord task, then handed to DERP I/O task */
     ml_derp_conn_t derp;
+    ml_derp_conn_t derp_extra[ML_DERP_EXTRA_CONNECTIONS];
+    uint64_t derp_next_extra_dial_ms; /* Writer-owned global dial pacing. */
+    SemaphoreHandle_t derp_map_mutex;
+    struct {
+        uint8_t key[32];
+        uint16_t region;
+    } derp_routes[ML_MAX_PEERS];
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
@@ -638,9 +678,13 @@ struct microlink_s {
      * payload is split across two reads must be completed, not dropped. */
     uint8_t *h2_acc;
     size_t   h2_acc_len;
+    size_t   h2_acc_cap;     /* allocated size (#48: not fixed without PSRAM) */
 
-    uint8_t *lp_acc;         /* PSRAM, ML_JSON_BUFFER_SIZE, lazily allocated */
+    uint8_t *lp_acc;         /* PSRAM: ML_JSON_BUFFER_SIZE + 1, lazily allocated;
+                              * no PSRAM (#48): grown on demand, freed when empty */
     size_t   lp_acc_len;
+    size_t   lp_acc_cap;     /* allocated size */
+    size_t   lp_skip;        /* #48, no PSRAM: bytes of a too-large message still to discard */
 
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
@@ -714,6 +758,8 @@ void ml_derp_tx_task(void *arg);
 void ml_derp_rx_task(void *arg);
 esp_err_t ml_derp_connect(microlink_t *ml);
 void ml_derp_disconnect(microlink_t *ml);
+void ml_derp_update_route(microlink_t *ml, int slot, const uint8_t *key, uint16_t region);
+bool ml_derp_region_endpoint(microlink_t *ml, uint16_t region, char host[64], int *port);
 
 /* Every microlink task calls this as its LAST statement before
  * vTaskDelete(NULL): after it returns the task must not touch ml again,
@@ -732,6 +778,7 @@ void ml_bind_sock_to_upstream(microlink_t *ml, int fd);
 
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);
+void ml_receive_filter_update(microlink_t *ml, const cJSON *map);
 void ml_wg_mgr_send_cmm(microlink_t *ml, uint32_t peer_vpn_ip);
 esp_err_t ml_wg_mgr_trigger_handshake(microlink_t *ml, uint32_t dest_vpn_ip);
 bool ml_wg_mgr_peer_is_up(microlink_t *ml, uint32_t vpn_ip);
@@ -790,7 +837,7 @@ esp_err_t ml_peer_nvs_clear(void);
 #ifdef CONFIG_ML_ZERO_COPY_WG
 /* ml_zerocopy.c */
 esp_err_t ml_zerocopy_init(microlink_t *ml);
-void ml_zerocopy_deinit(microlink_t *ml);
+esp_err_t ml_zerocopy_deinit(microlink_t *ml);
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,
                             uint32_t dest_ip, uint16_t dest_port);
 #endif

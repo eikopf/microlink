@@ -227,8 +227,8 @@ esp_err_t ml_zerocopy_init(microlink_t *ml) {
     return ESP_OK;
 }
 
-void ml_zerocopy_deinit(microlink_t *ml) {
-    if (!ml->zc.pcb) return;
+esp_err_t ml_zerocopy_deinit(microlink_t *ml) {
+    if (!ml->zc.pcb) return ESP_OK;
 
     ESP_LOGI(TAG, "Shutting down zero-copy WG path");
 
@@ -236,11 +236,15 @@ void ml_zerocopy_deinit(microlink_t *ml) {
         .ml = ml,
         .done = xSemaphoreCreateBinary(),
     };
-    if (!ctx.done) return;
+    if (!ctx.done) return ESP_ERR_NO_MEM;
 
-    tcpip_callback(zc_pcb_remove_in_tcpip, &ctx);
+    if (tcpip_callback(zc_pcb_remove_in_tcpip, &ctx) != ERR_OK) {
+        vSemaphoreDelete(ctx.done);
+        return ESP_ERR_NO_MEM;
+    }
     xSemaphoreTake(ctx.done, portMAX_DELAY);
     vSemaphoreDelete(ctx.done);
+    return ESP_OK;
 }
 
 esp_err_t ml_zerocopy_send(microlink_t *ml, const uint8_t *data, size_t len,

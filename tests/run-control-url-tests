@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+test_dir="$(mktemp -d)"
+trap 'rm -rf "$test_dir"' EXIT
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -g \
+    -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I "$repo_dir/components/microlink/include" \
+    "$repo_dir/tests/control_url_test.c" \
+    "$repo_dir/components/microlink/src/ml_control_url.c" \
+    -o "$test_dir/control-url-test"
+"$test_dir/control-url-test"

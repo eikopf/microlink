@@ -1,5 +1,12 @@
 menu "MicroLink V2 Configuration"
 
+    config ML_DERP_TLS_REQUIREMENTS
+        bool
+        default y
+        select MBEDTLS_CERTIFICATE_BUNDLE
+        select MBEDTLS_HAVE_TIME
+        select MBEDTLS_HAVE_TIME_DATE
+
     config ML_ZERO_COPY_WG
         bool "Enable zero-copy WireGuard receive (high-throughput mode)"
         default n
@@ -25,12 +32,15 @@ menu "MicroLink V2 Configuration"
         default 16
         range 1 64
         help
-            Maximum number of peers with active WireGuard tunnels. Each peer
-            uses approximately 200 bytes plus endpoint storage.
+            Maximum number of peers in the MicroLink and WireGuard tables.
+            Each peer requires entries in both tables, including keys and
+            endpoint storage. The memory cost depends on the build.
 
-            Most deployments need 1-4 peers (only the peers you actively
-            communicate with). For large tailnets, set this to the actual
-            peer count needed, not the total tailnet size.
+            Peers occupy slots when received from the coordinator or loaded
+            from the NVS cache, even if they have no active traffic. Peers
+            received after the table fills are not added. Set this limit to
+            fit the visible peers, reduce visibility with tailnet policy, or
+            configure a priority peer to reserve access to one server.
 
     config ML_PRIORITY_PEER_IP
         string "Priority peer VPN IP"

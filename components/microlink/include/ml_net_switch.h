@@ -84,7 +84,8 @@ typedef struct {
 esp_err_t ml_net_switch_init(const ml_net_switch_config_t *config);
 
 /**
- * Deinitialize and free resources.
+ * Deinitialize and free resources. Retains resources if shutdown is incomplete;
+ * call stop and retry deinit after the outstanding work exits.
  */
 void ml_net_switch_deinit(void);
 
@@ -98,6 +99,9 @@ esp_err_t ml_net_switch_start(void);
 
 /**
  * Stop all connections and halt the state machine.
+ * Lifecycle APIs must be serialized by the application and called outside
+ * module callbacks and the FreeRTOS timer task. A timeout retains the instance
+ * and transports; retry stop before starting or deinitializing again.
  *
  * @return ESP_OK on success
  */

@@ -42,6 +42,8 @@
 
 #ifdef CONFIG_ML_ENABLE_CELLULAR
 
+#include "ml_at_address.h"
+
 static const char *TAG = "ml_at_sock";
 
 /* ============================================================================
@@ -376,20 +378,6 @@ static int at_send_raw(const void *data, size_t len, int timeout_ms)
     }
 
     return (strstr(resp, "OK") != NULL) ? (int)len : -1;
-}
-
-/* Format IP from sockaddr to string (supports both IPv4 and IPv6) */
-static void sockaddr_to_str(const struct sockaddr *addr, char *buf, size_t buflen, uint16_t *port)
-{
-    if (addr->sa_family == AF_INET) {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
-        inet_ntoa_r(sin->sin_addr, buf, buflen);
-        if (port) *port = ntohs(sin->sin_port);
-    } else if (addr->sa_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
-        inet_ntop(AF_INET6, &sin6->sin6_addr, buf, buflen);
-        if (port) *port = ntohs(sin6->sin6_port);
-    }
 }
 
 /* ============================================================================
@@ -746,7 +734,7 @@ int ml_at_connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 
     char ip_str[INET6_ADDRSTRLEN];  /* 46 bytes — fits IPv4 and IPv6 */
     uint16_t port;
-    sockaddr_to_str(addr, ip_str, sizeof(ip_str), &port);
+    if (!ml_at_address(addr, addrlen, ip_str, sizeof(ip_str), &port)) return -1;
 
     const char *proto = (s->type == SOCK_STREAM) ? "TCP" : "UDP";
     char cmd[192];  /* Larger for IPv6 addresses */
@@ -984,7 +972,7 @@ ssize_t ml_at_sendto(int fd, const void *buf, size_t len, int flags,
 
     char ip_str[INET6_ADDRSTRLEN];  /* 46 bytes — fits IPv4 and IPv6 */
     uint16_t port;
-    sockaddr_to_str(dest_addr, ip_str, sizeof(ip_str), &port);
+    if (!ml_at_address(dest_addr, addrlen, ip_str, sizeof(ip_str), &port)) return -1;
 
     /* For UDP, if not yet "connected" (CIPOPEN), open it first */
     if (!s->connected) {

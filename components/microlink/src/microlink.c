@@ -7,6 +7,8 @@
  */
 
 #include "microlink_internal.h"
+#include "ml_control_url.h"
+#include "ml_nodekey.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -53,61 +55,51 @@ static void generate_keypair(uint8_t *private_key, uint8_t *public_key) {
     ml_x25519_base(public_key, private_key, 1);
 }
 
+static esp_err_t load_keypair(nvs_handle_t nvs, const char *name,
+                              uint8_t private_key[32], uint8_t public_key[32], bool *need_save) {
+    size_t length = 32;
+    esp_err_t result = nvs_get_blob(nvs, name, private_key, &length);
+    if (result == ESP_ERR_NVS_NOT_FOUND) {
+        generate_keypair(private_key, public_key);
+        *need_save = true;
+        return ESP_OK;
+    }
+    if (result != ESP_OK) return result;
+    if (length != 32) return ESP_ERR_INVALID_STATE;
+    ml_x25519_base(public_key, private_key, 1);
+    return ESP_OK;
+}
+
 static esp_err_t load_or_generate_keys(microlink_t *ml) {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "NVS open failed (%d), generating ephemeral keys", err);
-        generate_keypair(ml->machine_private_key, ml->machine_public_key);
-        generate_keypair(ml->wg_private_key, ml->wg_public_key);
-        generate_keypair(ml->disco_private_key, ml->disco_public_key);
-        ml->identity_persistent = false;
-        return ESP_OK;
+        ESP_LOGE(TAG, "Cannot open identity storage: %s", esp_err_to_name(err));
+        return err;
     }
-
-    size_t key_len = 32;
     bool need_save = false;
-
-    /* Machine key */
-    if (nvs_get_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->machine_private_key, ml->machine_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new machine key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, &key_len);
-    }
-
-    /* WireGuard key */
-    key_len = 32;
-    if (nvs_get_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->wg_private_key, ml->wg_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new WireGuard key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, &key_len);
-    }
-
-    /* DISCO key */
-    key_len = 32;
-    if (nvs_get_blob(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, &key_len) != ESP_OK) {
-        generate_keypair(ml->disco_private_key, ml->disco_public_key);
-        need_save = true;
-        ESP_LOGI(TAG, "Generated new DISCO key");
-    } else {
-        key_len = 32;
-        nvs_get_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, &key_len);
+    err = load_keypair(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, ml->machine_public_key, &need_save);
+    if (err == ESP_OK) err = load_keypair(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, ml->wg_public_key, &need_save);
+    if (err == ESP_OK) err = load_keypair(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, ml->disco_public_key, &need_save);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot read identity keys: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
     }
 
     if (need_save) {
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PRI, ml->machine_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_MACHINE_PUB, ml->machine_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PRI, ml->wg_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_WG_PUB, ml->wg_public_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PRI, ml->disco_private_key, 32);
-        nvs_set_blob(nvs, NVS_KEY_DISCO_PUB, ml->disco_public_key, 32);
-        nvs_commit(nvs);
+        const char *names[] = { NVS_KEY_MACHINE_PRI, NVS_KEY_MACHINE_PUB, NVS_KEY_WG_PRI,
+                                NVS_KEY_WG_PUB, NVS_KEY_DISCO_PRI, NVS_KEY_DISCO_PUB };
+        const uint8_t *values[] = { ml->machine_private_key, ml->machine_public_key, ml->wg_private_key,
+                                    ml->wg_public_key, ml->disco_private_key, ml->disco_public_key };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && err == ESP_OK; ++i)
+            err = nvs_set_blob(nvs, names[i], values[i], 32);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Cannot persist identity keys: %s", esp_err_to_name(err));
+            nvs_close(nvs);
+            return err;
+        }
         ESP_LOGI(TAG, "Keys saved to NVS");
     } else {
         ESP_LOGI(TAG, "Keys loaded from NVS");
@@ -116,6 +108,14 @@ static esp_err_t load_or_generate_keys(microlink_t *ml) {
      * applications via microlink_diag_t so the UI can tell the operator
      * whether the device is registered-but-stale vs genuinely fresh. */
     ml->identity_persistent = !need_save;
+
+    err = ml_nodekey_load(nvs, ml->wg_private_key, ml->wg_public_key,
+                          ml->wg_old_public_key, &ml->wg_rotation_pending);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "Cannot load rotated node identity: %s", esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
 
     nvs_close(nvs);
     return ESP_OK;
@@ -179,6 +179,17 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         return NULL;
     }
 
+    if (config->ctrl_host && config->ctrl_host[0]) {
+        char host[sizeof(ml->ctrl_host)], port[6];
+        if (strlen(config->ctrl_host) >= sizeof(ml->ctrl_host) ||
+            ml_parse_control_url(config->ctrl_host, host, sizeof(host),
+                                 port, sizeof(port), NULL) != 0) {
+            ESP_LOGE(TAG, "Invalid custom coordinator URL: HTTPS required, maximum 63 characters");
+            free(ml);
+            return NULL;
+        }
+    }
+
     /* Copy config */
     ml->config = *config;
     if (ml->config.max_peers == 0) ml->config.max_peers = ML_MAX_PEERS;
@@ -190,6 +201,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->derp_region_default = ml->config.preferred_derp_region
                               ? ml->config.preferred_derp_region
                               : ML_DERP_REGION;
+    ml->derp_home_region = ml->derp_region_default;
 
     ml->state = ML_STATE_IDLE;
     ml->register_user_id = -1;        /* "no RegisterResponse yet" */
@@ -202,6 +214,10 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_sock = -1;
     ml->stun_sock6 = -1;
     ml->derp.sockfd = -1;
+    for (int i = 0; i < ML_DERP_EXTRA_CONNECTIONS; ++i) {
+        ml->derp_extra[i].sockfd = -1;
+        ml_derp_rx_set_parked(&ml->derp_extra[i], true);
+    }
 
     /* Resolve timing (0 = use defaults from #defines) */
     ml->t_disco_heartbeat_ms = ml->config.disco_heartbeat_ms ? ml->config.disco_heartbeat_ms : ML_DISCO_HEARTBEAT_MS;
@@ -358,12 +374,34 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         return NULL;
     }
 
+    ml->derp_map_mutex = xSemaphoreCreateMutex();
+    if (!ml->derp_map_mutex) {
+        microlink_destroy(ml);
+        return NULL;
+    }
+
+    ml->receive_filter = ml_filter_create();
+    ml->filter_mutex = xSemaphoreCreateMutex();
+    if (!ml->receive_filter || !ml->filter_mutex) {
+        ESP_LOGE(TAG, "Failed to create receive filter");
+        microlink_destroy(ml);
+        return NULL;
+    }
+
     ESP_LOGI(TAG, "MicroLink v2 initialized (max_peers=%d)", ml->config.max_peers);
     return ml;
 }
 
 esp_err_t microlink_start(microlink_t *ml) {
     if (!ml) return ESP_ERR_INVALID_ARG;
+    if (__atomic_load_n(&ml->node_key_restart_required, __ATOMIC_ACQUIRE)) {
+        ESP_LOGW(TAG, "Replacement node key requires destroy and initialization");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ml->stop_incomplete || __atomic_load_n(&ml->tasks_alive, __ATOMIC_SEQ_CST) > 0) {
+        ESP_LOGW(TAG, "Previous workers have not completed shutdown");
+        return ESP_ERR_INVALID_STATE;
+    }
     if (ml->state != ML_STATE_IDLE) {
         ESP_LOGW(TAG, "Already started (state=%d)", ml->state);
         return ESP_ERR_INVALID_STATE;
@@ -513,6 +551,9 @@ esp_err_t microlink_stop(microlink_t *ml) {
      * without invalidating the fd, so each task still closes its own socket
      * in its normal error path and there is no double-close / fd-reuse race. */
     if (ml->derp.sockfd >= 0) shutdown(ml->derp.sockfd, SHUT_RDWR);
+    for (int i = 0; i < ML_DERP_EXTRA_CONNECTIONS; ++i) {
+        if (ml->derp_extra[i].sockfd >= 0) shutdown(ml->derp_extra[i].sockfd, SHUT_RDWR);
+    }
     if (ml->coord_sock >= 0)  shutdown(ml->coord_sock,  SHUT_RDWR);
     /* TLS control-plane connection: coord_sock is -1 and the fd lives inside
      * the esp_tls handle — shut that down too so a blocked esp_tls_conn_read
@@ -554,6 +595,7 @@ esp_err_t microlink_stop(microlink_t *ml) {
             ESP_LOGE(TAG, "%d task(s) still running %d ms after the stop request -- "
                           "the instance will be leaked rather than freed under them", left, waited);
             ml->stop_incomplete = true;
+            return ESP_ERR_TIMEOUT;
         } else {
             ESP_LOGI(TAG, "All tasks exited (%d ms)", waited);
             /* microlink_destroy() stops again before it frees. If an earlier
@@ -576,7 +618,11 @@ esp_err_t microlink_stop(microlink_t *ml) {
 
     /* Clean up zero-copy PCB if active */
 #ifdef CONFIG_ML_ZERO_COPY_WG
-    ml_zerocopy_deinit(ml);
+    esp_err_t zc_result = ml_zerocopy_deinit(ml);
+    if (zc_result != ESP_OK) {
+        ml->stop_incomplete = true;
+        return zc_result;
+    }
 #endif
 
     /* Close sockets */
@@ -589,15 +635,23 @@ esp_err_t microlink_stop(microlink_t *ml) {
     return ESP_OK;
 }
 
+void ml_receive_filter_update(microlink_t *ml, const cJSON *map) {
+    if (!ml->filter_mutex) return;
+    xSemaphoreTake(ml->filter_mutex, portMAX_DELAY);
+    bool valid = true;
+    if (map) valid = ml_filter_update(ml->receive_filter, map);
+    else ml_filter_reset(ml->receive_filter);
+    xSemaphoreGive(ml->filter_mutex);
+    if (!valid) ESP_LOGE(TAG, "Receive policy invalid, unsupported, or too large; ingress denied");
+}
+
 void microlink_destroy(microlink_t *ml) {
     if (!ml) return;
 
     microlink_stop(ml);
     if (ml->stop_incomplete) {
-        /* A task is still executing on this instance. Freeing it now is the
-         * use-after-free we are here to avoid; a leaked instance is the
-         * lesser evil and is loud in the log. */
-        ESP_LOGE(TAG, "Destroy skipped: a task still runs on this instance (leaked on purpose)");
+        /* Workers or a live zero-copy PCB still reference this instance. */
+        ESP_LOGE(TAG, "Destroy skipped: shutdown is incomplete; instance retained");
         return;
     }
     /* Only now is everything the tasks owned quiescent. The DERP TLS state
@@ -644,6 +698,9 @@ void microlink_destroy(microlink_t *ml) {
 
     /* Delete event group */
     if (ml->events) vEventGroupDelete(ml->events);
+    ml_filter_destroy(ml->receive_filter);
+    if (ml->filter_mutex) vSemaphoreDelete(ml->filter_mutex);
+    if (ml->derp_map_mutex) vSemaphoreDelete(ml->derp_map_mutex);
 
     /* Clear keys from memory */
     memset(ml->machine_private_key, 0, 32);
@@ -660,6 +717,10 @@ void microlink_destroy(microlink_t *ml) {
 
 void ml_task_exiting(microlink_t *ml) {
     if (ml) __atomic_sub_fetch(&ml->tasks_alive, 1, __ATOMIC_SEQ_CST);
+}
+
+bool microlink_node_key_restart_required(const microlink_t *ml) {
+    return ml && __atomic_load_n(&ml->node_key_restart_required, __ATOMIC_ACQUIRE);
 }
 
 microlink_state_t microlink_get_state(const microlink_t *ml) {
@@ -770,10 +831,6 @@ esp_err_t microlink_get_diag(const microlink_t *ml, microlink_diag_t *out) {
     strlcpy(out->register_user_name, ml->register_user_name,
             sizeof out->register_user_name);
     out->identity_persistent = ml->identity_persistent;
-    out->rc_coord_stream_wd = ml->rc_coord_stream_wd;
-    out->rc_coord_transport = ml->rc_coord_transport;
-    out->rc_derp_rx_wd      = ml->rc_derp_rx_wd;
-    out->rc_derp_retry      = ml->rc_derp_retry;
     /* First 16 hex chars of the WG public key (= 8 bytes). Enough to
      * eyeball-match against `headscale nodes list` output. */
     for (int i = 0; i < 8; i++) {

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_dir="$(cd "$(dirname "$0")/.." && pwd)"
+test_dir="$(mktemp -d)"
+trap 'rm -rf "$test_dir"' EXIT
+mkdir -p "$test_dir/freertos"
+cp "$repo_dir/components/microlink/include/ml_net_switch.h" "$test_dir/"
+cp "$repo_dir/tests/net_switch_platform.h" "$test_dir/"
+for header in sdkconfig.h esp_err.h microlink.h ml_cellular.h ml_at_socket.h ml_config_httpd.h esp_wifi.h esp_event.h esp_log.h esp_netif.h freertos/FreeRTOS.h freertos/task.h freertos/event_groups.h freertos/timers.h; do
+    printf '#include "net_switch_platform.h"\n' > "$test_dir/$header"
+done
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-variable \
+    -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+    -I "$test_dir" "$repo_dir/tests/net_switch_test.c" -o "$test_dir/net-switch-test"
+"$test_dir/net-switch-test"

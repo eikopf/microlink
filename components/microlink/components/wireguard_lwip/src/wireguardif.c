@@ -125,22 +125,6 @@ static int mask_prefix_len(uint32_t mask_hbo) {
 	return n;
 }
 
-bool wireguardif_has_host_route(struct netif *netif, const ip4_addr_t *ip) {
-	if (!netif || !netif->state || !ip) return false;
-	struct wireguard_device *device = (struct wireguard_device *)netif->state;
-	for (int x = 0; x < WIREGUARD_MAX_PEERS; x++) {
-		struct wireguard_peer *peer = &device->peers[x];
-		if (!peer->valid) continue;
-		for (int y = 0; y < WIREGUARD_MAX_SRC_IPS; y++) {
-			struct wireguard_allowed_ip *aip = &peer->allowed_source_ips[y];
-			if (!aip->valid || !IP_IS_V4(&aip->ip)) continue;
-			if (ip4_addr_get_u32(ip_2_ip4(&aip->mask)) != IPADDR_BROADCAST) continue;
-			if (ip4_addr_get_u32(ip_2_ip4(&aip->ip)) == ip4_addr_get_u32(ip)) return true;
-		}
-	}
-	return false;
-}
-
 static struct wireguard_peer *peer_lookup_by_allowed_ip(struct wireguard_device *device, const ip_addr_t *ipaddr) {
 	/* Longest-prefix match across every peer's allowed_source_ips.
 	 *
@@ -210,7 +194,13 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
 	 * DRAM, the alloc fails (ERR_MEM, errno=-1) and the packet drops.
 	 * SPIRAM has 8 MB headroom; per-packet latency is ~10 us extra,
 	 * negligible vs the rest of the WG path. */
-	#define WG_OUT_ALLOC(sz)  heap_caps_malloc((sz), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+	/* #48: a board without PSRAM has no SPIRAM heap at all and used to get
+	 * ERR_MEM on every packet, handshake included - it takes the default
+	 * heap instead. A PSRAM board keeps SPIRAM-only, exactly as before
+	 * (no silent spill into internal DRAM when SPIRAM is exhausted). */
+	static int8_t wg_out_no_spiram = -1;
+	if (wg_out_no_spiram < 0) wg_out_no_spiram = (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) ? 1 : 0;
+	#define WG_OUT_ALLOC(sz)  heap_caps_malloc((sz), wg_out_no_spiram ? MALLOC_CAP_DEFAULT : (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT))
 	#define WG_OUT_FREE(p)    heap_caps_free(p)
 
 	// Check if peer has a direct endpoint (non-zero IP and port)
@@ -1336,7 +1326,6 @@ static void wireguardif_tmr(void *arg) {
 	sys_timeout(WIREGUARDIF_TIMER_MSECS, wireguardif_tmr, device);
 
 	// Check periodic things
-	bool link_up = false;
 	for (x=0; x < WIREGUARD_MAX_PEERS; x++) {
 		peer = &device->peers[x];
 		if (peer->valid) {
@@ -1362,16 +1351,7 @@ static void wireguardif_tmr(void *arg) {
 			if (should_send_initiation(peer)) {
 				wireguard_start_handshake(device->netif, peer);
 			}
-
-			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
-				link_up = true;
-			}
 		}
-	}
-
-	if (!link_up) {
-		// Clear the IF-UP flag on netif
-		netif_set_link_down(device->netif);
 	}
 }
 
@@ -1400,7 +1380,6 @@ void wireguardif_periodic(struct netif *netif) {
 	int handshakes_this_tick = 0;
 	const int MAX_HANDSHAKES_PER_TICK = 1;
 
-	bool link_up = false;
 	for (x = 0; x < WIREGUARD_MAX_PEERS; x++) {
 		int peer_idx = (s_next_hs_peer_idx + x) % WIREGUARD_MAX_PEERS;
 		peer = &device->peers[peer_idx];
@@ -1436,13 +1415,7 @@ void wireguardif_periodic(struct netif *netif) {
 				}
 				// else: throttled this tick, next tick (round-robin) gets the chance
 			}
-			if ((peer->curr_keypair.valid) || (peer->prev_keypair.valid)) {
-				link_up = true;
-			}
 		}
-	}
-	if (!link_up) {
-		netif_set_link_down(device->netif);
 	}
 }
 
@@ -1541,8 +1514,8 @@ err_t wireguardif_init(struct netif *netif) {
 								netif->linkoutput = NULL;
 								netif->hwaddr_len = 0;
 								netif->mtu = WIREGUARDIF_MTU;
-								// We set up no state flags here - caller should set them
-								// NETIF_FLAG_LINK_UP is automatically set/cleared when at least one peer is connected
+								// The caller enables the link. Keep it up without
+								// sessions so lwIP can route traffic that starts a lazy handshake.
 								netif->flags = 0;
 
 								udp_recv(udp, wireguardif_network_rx, device);
